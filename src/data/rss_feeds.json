@@ -1,0 +1,104 @@
+[
+    {
+        "name": "OpenAI Blog",
+        "url": "https://openai.com/blog/rss",
+        "category": "official",
+        "tags": ["capability", "landscape"]
+    },
+    {
+        "name": "Anthropic News",
+        "url": "https://www.anthropic.com/news.xml",
+        "category": "official",
+        "tags": ["capability", "cost", "landscape"]
+    },
+    {
+        "name": "Google Research Blog",
+        "url": "https://blog.google/technology/ai/rss",
+        "category": "official",
+        "tags": ["capability", "paradigm"]
+    },
+    {
+        "name": "Microsoft Research",
+        "url": "https://www.microsoft.com/en-us/research/feed/",
+        "category": "official",
+        "tags": ["capability", "paradigm"]
+    },
+    {
+        "name": "NVIDIA Developer Blog",
+        "url": "https://developer.nvidia.com/blog/feed/",
+        "category": "official",
+        "tags": ["capability", "paradigm"]
+    },
+    {
+        "name": "Hugging Face Blog",
+        "url": "https://huggingface.co/blog/feed.xml",
+        "category": "official",
+        "tags": ["capability", "paradigm", "landscape"]
+    },
+    {
+        "name": "arXiv cs.AI",
+        "url": "https://rss.arxiv.org/rss/cs.AI",
+        "category": "academic",
+        "tags": ["capability", "paradigm"]
+    },
+    {
+        "name": "arXiv cs.LG",
+        "url": "https://rss.arxiv.org/rss/cs.LG",
+        "category": "academic",
+        "tags": ["capability", "paradigm"]
+    },
+    {
+        "name": "arXiv cs.CL",
+        "url": "https://rss.arxiv.org/rss/cs.CL",
+        "category": "academic",
+        "tags": ["capability", "paradigm"]
+    },
+    {
+        "name": "TechCrunch",
+        "url": "https://techcrunch.com/feed/",
+        "category": "media",
+        "tags": ["landscape", "cost", "business"]
+    },
+    {
+        "name": "The Verge",
+        "url": "https://www.theverge.com/rss/index.xml",
+        "category": "media",
+        "tags": ["landscape", "cost", "business"]
+    },
+    {
+        "name": "Ars Technica",
+        "url": "https://arstechnica.com/feed/",
+        "category": "media",
+        "tags": ["landscape", "cost", "business"]
+    },
+    {
+        "name": "MIT Technology Review",
+        "url": "https://www.technologyreview.com/feed/",
+        "category": "media",
+        "tags": ["landscape", "cost", "business"]
+    },
+    {
+        "name": "VentureBeat",
+        "url": "https://venturebeat.com/feed/",
+        "category": "media",
+        "tags": ["landscape", "cost", "business"]
+    },
+    {
+        "name": "Lex Fridman Podcast",
+        "url": "https://lexfridman.com/feed/podcast/",
+        "category": "podcast",
+        "tags": ["paradigm", "capability"]
+    },
+    {
+        "name": "Dwarkesh Patel Podcast",
+        "url": "https://www.dwarkesh.p.sh/feed.xml",
+        "category": "podcast",
+        "tags": ["paradigm", "capability"]
+    },
+    {
+        "name": "a16z Podcast",
+        "url": "https://a16z.com/feed/",
+        "category": "podcast",
+        "tags": ["landscape", "business"]
+    }
+]
