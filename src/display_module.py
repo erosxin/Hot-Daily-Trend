@@ -2,6 +2,9 @@
 import logging
 from typing import List
 from src.data_models import Article
+import os
+from pathlib import Path
+
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
@@ -238,7 +241,7 @@ class DisplayModule:
             stats_output.append(f"\n### By Tag")
             for tag, count in sorted(tag_counts.items(), key=lambda x: x[1], reverse=True):
                 stats_output.append(f"- {tag}: {count}")
-        
+
         # 按实体统计（entities 现在是 Dict[str, List[str]]）
         entity_counts = {}
         for article in articles:
@@ -246,10 +249,160 @@ class DisplayModule:
                 for entity_type, entity_values in article.entities.items():
                     for entity in entity_values:
                         entity_counts[entity] = entity_counts.get(entity, 0) + 1
-        
+
         if entity_counts:
             stats_output.append(f"\n### Top Entities")
             for entity, count in sorted(entity_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
                 stats_output.append(f"- {entity}: {count}")
-        
+
         return "\n".join(stats_output)
+
+    def generate_email_html(self, articles: List[Article], base_url: str) -> str:
+        base_url = (base_url or "").rstrip("/")
+
+        # Sort by heat_score then published
+        if not articles:
+            return "<h2>今日暂无可用AI新闻</h2>"
+
+        def _published_ts(article: Article) -> float:
+            if not article.published:
+                return 0.0
+            if isinstance(article.published, datetime):
+                dt = article.published
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+                return dt.timestamp()
+            if isinstance(article.published, str):
+                try:
+                    published_str = article.published.replace('Z', '+00:00')
+                    dt = datetime.fromisoformat(published_str).astimezone(timezone.utc)
+                    return dt.timestamp()
+                except Exception:
+                    return 0.0
+            return 0.0
+
+        def score_key(a: Article):
+            return (a.heat_score or 0, _published_ts(a))
+
+        top_articles = sorted(articles, key=score_key, reverse=True)
+
+        # Trend radar
+        trend_counts = {}
+        for a in articles:
+            tag = a.trend_tag or (a.main_tags[0] if a.main_tags else "其他")
+            trend_counts[tag] = trend_counts.get(tag, 0) + 1
+
+        trend_items = "".join([f"<li>{k}: {v}</li>" for k, v in sorted(trend_counts.items(), key=lambda x: x[1], reverse=True)])
+
+        rows = []
+        for a in top_articles:
+            heat = f"{int(a.heat_score)}" if a.heat_score is not None else "-"
+            summary = a.summary_zh or a.summary or ""
+            key_points = "".join([f"<li>{p}</li>" for p in (a.key_points or [])[:3]])
+            fav_link = f"{base_url}/favorite.html?id={a.id}" if a.id else "#"
+            rows.append(
+                f"""
+                <div style='padding:12px 0;border-bottom:1px solid #eee;'>
+                  <div style='font-size:16px;font-weight:600;margin-bottom:6px;'>{a.title}</div>
+                  <div style='color:#666;font-size:12px;margin-bottom:8px;'>来源: {a.source} | 热度: {heat}</div>
+                  <div style='font-size:14px;margin-bottom:6px;'>{summary}</div>
+                  <ul style='margin:4px 0 8px 18px;padding:0;'>{key_points}</ul>
+                  <div style='font-size:13px;'>
+                    <a href='{str(a.link)}' target='_blank'>查看原文</a> | 
+                    <a href='{fav_link}' target='_blank'>收藏并生成简析</a>
+                  </div>
+                </div>
+                """
+            )
+
+        html = f"""
+        <html><body style='font-family:Arial,Helvetica,sans-serif;'>
+          <h2>每日AI趋势简报</h2>
+          <h3>趋势雷达</h3>
+          <ul>{trend_items}</ul>
+          <h3>今日要闻</h3>
+          {''.join(rows)}
+        </body></html>
+        """
+        return html
+
+    def generate_static_site(self, output_dir: Path, articles: List[Article], base_url: str, supabase_url: str, supabase_anon_key: str) -> None:
+        base_url = (base_url or "").rstrip("/")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Main index page
+        items_html = []
+        for a in articles:
+            heat = f"{int(a.heat_score)}" if a.heat_score is not None else "-"
+            summary = a.summary_zh or a.summary or ""
+            fav_link = f"{base_url}/favorite.html?id={a.id}" if a.id else "#"
+            items_html.append(
+                f"""
+                <div class='item'>
+                  <div class='title'>{a.title}</div>
+                  <div class='meta'>来源: {a.source} | 热度: {heat}</div>
+                  <div class='summary'>{summary}</div>
+                  <div class='links'>
+                    <a href='{str(a.link)}' target='_blank'>查看原文</a>
+                    <a href='{fav_link}' target='_blank'>收藏并生成简析</a>
+                  </div>
+                </div>
+                """
+            )
+
+        index_html = f"""
+        <html>
+        <head>
+          <meta charset='utf-8' />
+          <title>AI Daily Trend</title>
+          <style>
+            body {{ font-family: Arial, sans-serif; margin: 24px; color: #111; }}
+            .item {{ padding: 12px 0; border-bottom: 1px solid #eee; }}
+            .title {{ font-size: 18px; font-weight: 600; margin-bottom: 6px; }}
+            .meta {{ font-size: 12px; color: #666; margin-bottom: 6px; }}
+            .summary {{ font-size: 14px; margin-bottom: 6px; }}
+            .links a {{ margin-right: 10px; }}
+          </style>
+        </head>
+        <body>
+          <h2>每日AI趋势简报</h2>
+          {''.join(items_html)}
+        </body>
+        </html>
+        """
+
+        (output_dir / "index.html").write_text(index_html, encoding="utf-8")
+
+        # Favorite handler page (static)
+        favorite_html = f"""
+        <html>
+        <head><meta charset='utf-8' /></head>
+        <body>
+          <h3>正在收藏...</h3>
+          <script>
+            const params = new URLSearchParams(window.location.search);
+            const id = params.get('id');
+            if (!id) {{ document.body.innerHTML = '<h3>缺少文章ID</h3>'; }}
+            const url = '{supabase_url}/rest/v1/articles?id=eq.' + encodeURIComponent(id);
+            fetch(url, {{
+              method: 'PATCH',
+              headers: {{
+                'apikey': '{supabase_anon_key}',
+                'Authorization': 'Bearer {supabase_anon_key}',
+                'Content-Type': 'application/json',
+                'Prefer': 'return=representation'
+              }},
+              body: JSON.stringify({{ is_favorite: true }})
+            }}).then(res => res.json()).then(data => {{
+              document.body.innerHTML = '<h3>收藏成功，简析将在下一次任务运行后生成</h3>';
+            }}).catch(err => {{
+              document.body.innerHTML = '<h3>收藏失败，请稍后重试</h3>';
+            }});
+          </script>
+        </body>
+        </html>
+        """
+
+        (output_dir / "favorite.html").write_text(favorite_html, encoding="utf-8")

@@ -104,7 +104,7 @@ class Settings:
 
         # Output and Email Configuration
         from pathlib import Path
-        self.OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "output"))
+        self.OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "docs"))
         self.RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "")
         self.SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "")
         self.GITHUB_PAGES_BASE_URL = os.environ.get("GITHUB_PAGES_BASE_URL", "")
