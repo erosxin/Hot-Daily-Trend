@@ -7,7 +7,7 @@
             const params = new URLSearchParams(window.location.search);
             const id = params.get('id');
             if (!id) { document.body.innerHTML = '<h3>缺少文章ID</h3>'; }
-            const url = 'http://ietunkxgukxpeacoiigl.supabase.co/rest/v1/articles?id=eq.' + encodeURIComponent(id);
+            const url = 'https://ietunkxgukxpeacoiigl.supabase.co/rest/v1/articles?id=eq.' + encodeURIComponent(id);
             fetch(url, {
               method: 'PATCH',
               headers: {
