@@ -199,6 +199,31 @@ Hot-Daily-Trend/
 
 ### 常见错误
 
+## ✅ 新增功能（本次修复）
+- 中文简报 + 三条要点 + 趋势标签 + 热度分
+- 邮件汇总（Resend）
+- 静态页面 + 收藏入口（GitHub Pages）
+- 收藏后在下一次任务运行生成“简析”
+- 每天早上 7:00 北京时间自动运行（GitHub Actions）
+
+## 🧩 Supabase 表结构更新
+执行 `SUPABASE_SCHEMA_UPDATE.sql` 以增加新字段与 RLS policy。
+
+## 🔐 需要在 GitHub Secrets 中配置
+- SUPABASE_URL
+- SUPABASE_ANON_KEY
+- SUPABASE_SERVICE_ROLE_KEY
+- OPENAI_API_KEY
+- SERPER_API_KEY
+- RESEND_API_KEY
+- RECIPIENT_EMAIL
+- SENDER_EMAIL
+- GITHUB_PAGES_BASE_URL
+
+## 📧 Resend 发送方说明
+SENDER_EMAIL 必须是 Resend 中已验证的域名邮箱。
+
+
 #### 1. ModuleNotFoundError: No module named 'src'
 
 **原因**：直接运行 `python src/main_scraper.py` 时，Python 无法找到 `src` 模块。

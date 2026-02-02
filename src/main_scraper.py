@@ -17,6 +17,9 @@ from src.scrapers.serper_news_scraper import SerperNewsScraper
 # Corrected NLP processor import
 from src.nlp_processor import process_articles_batch as nlp_process_articles_batch
 
+from src.email_sender import send_daily_email
+from src.nlp_processor import generate_favorite_analysis
+
 # Corrected DisplayModule import
 from src.display_module import DisplayModule
 
@@ -154,16 +157,38 @@ async def main():
     logger.info(f"ArxivScraper task created for categories: {settings.ARXIV_CATEGORIES}")
     
     # RSSScraper
-    rss_scraper = RSSScraper(feed_configs=rss_feed_configs)
+    rss_scraper = RSSScraper(
+        feed_configs=rss_feed_configs,
+        max_entries_per_feed=settings.MAX_ARTICLES_PER_FEED,
+        skip_full_content_for_arxiv=True
+    )
     rss_task = collect_from_async_iterator(
         rss_scraper.scrape_articles(days_ago=settings.DAYS_AGO, fetch_full_content=True)
     )
     scraper_tasks.append(rss_task)
     logger.info(f"RSSScraper task created for {len(rss_feed_configs)} feeds")
     
-    # SerperNewsScraper - Note: This scraper only has a search() method, not scrape_articles()
-    # We'll skip it for now
-    logger.info("Note: SerperNewsScraper is skipped as it requires additional conversion logic.")
+    # SerperNewsScraper
+    try:
+        serper_scraper = SerperNewsScraper()
+        serper_results = serper_scraper.search("AI news OR artificial intelligence OR LLM", num=20)
+        serper_articles: List[Article] = []
+        for item in serper_results:
+            raw = {
+                "title": item.get("title"),
+                "link": item.get("link"),
+                "published": item.get("date") or datetime.utcnow(),
+                "source": item.get("source") or "Serper News",
+                "summary": item.get("snippet")
+            }
+            try:
+                serper_articles.append(Article.from_raw_article(raw))
+            except Exception as e:
+                logger.warning(f"Serper item conversion failed: {e}")
+        scraper_tasks.append(asyncio.sleep(0, result=serper_articles))
+        logger.info(f"SerperNewsScraper collected {len(serper_articles)} items")
+    except Exception as e:
+        logger.warning(f"SerperNewsScraper skipped due to error: {e}")
 
     # Await all scraper tasks with error handling
     logger.info(f"Awaiting {len(scraper_tasks)} scraper tasks concurrently...")
@@ -320,41 +345,41 @@ async def main():
         logger.warning("Please ensure SUPABASE_URL and SUPABASE_KEY are set correctly in your environment/config, and articles are successfully processed.")
     logger.info(f"------------------------------------------")
 
-    # --- New steps: Static Page Generation and Email Sending ---
-    logger.info("Proceeding with generating static HTML page and preparing email content.")
-    try:
-        logger.info(f"Using output directory: {settings.OUTPUT_DIR}")
-        logger.info(f"Using recipient email: {settings.RECIPIENT_EMAIL}")
-        logger.info(f"Using sender email: {settings.SENDER_EMAIL}")
-        logger.info(f"Using GitHub Pages Base URL: {settings.GITHUB_PAGES_BASE_URL}")
-    except AttributeError as e:
-        logger.warning(f"Some configuration attributes are missing: {e}. Using defaults.")
-        logger.info("Note: OUTPUT_DIR, RECIPIENT_EMAIL, SENDER_EMAIL, GITHUB_PAGES_BASE_URL may not be configured.")
+    # --- Static Page Generation and Email Sending ---
+    logger.info("Generating static page and preparing email content.")
+    display_module = DisplayModule()
 
-    # Use DisplayModule with processed_articles
     if processed_articles:
-        display_module = DisplayModule() # No articles passed at init
-        mindmap_content = display_module.generate_mindmap_markdown(processed_articles)
-        timeline_content = display_module.generate_timeline_markdown(processed_articles)
-        summary_statistics = display_module.generate_summary_statistics(processed_articles)
-        
-        logger.info(f"Generated mindmap content (first 200 chars): {mindmap_content[:200]}...")
-        logger.info(f"Generated timeline content (first 200 chars): {timeline_content[:200]}...")
-        logger.info(f"Generated summary statistics (first 200 chars): {summary_statistics[:200]}...")
-        
-        # Placeholder for writing to files and sending email
-        # Example:
-        # with open(os.path.join(settings.OUTPUT_DIR, "mindmap.md"), "w", encoding="utf-8") as f:
-        #     f.write(mindmap_content)
-        # with open(os.path.join(settings.OUTPUT_DIR, "timeline.md"), "w", encoding="utf-8") as f:
-        #     f.write(timeline_content)
-        # EmailSender.send_email(to=settings.RECIPIENT_EMAILS, subject="Daily Trend Report", body=timeline_content)
-        
-    else:
-        logger.warning("No processed articles available for DisplayModule. Static page and email content will be empty or minimal.")
+        email_html = display_module.generate_email_html(processed_articles, settings.GITHUB_PAGES_BASE_URL)
+        display_module.generate_static_site(
+            settings.OUTPUT_DIR,
+            processed_articles,
+            settings.GITHUB_PAGES_BASE_URL,
+            settings.SUPABASE_URL,
+            settings.SUPABASE_ANON_KEY
+        )
 
-    logger.info("Static page generation and email sending will be finalized in subsequent steps.")
-    # --- End of new steps ---
+        if settings.SENDER_EMAIL and settings.RECIPIENT_EMAIL:
+            send_daily_email("每日AI趋势简报", email_html)
+        else:
+            logger.warning("SENDER_EMAIL or RECIPIENT_EMAIL missing, skipping email send.")
+    else:
+        logger.warning("No processed articles available. Skipping email and static site generation.")
+
+    # --- Favorite analysis ---
+    if supabase_manager is not None:
+        try:
+            favorite_articles = await asyncio.to_thread(supabase_manager.fetch_favorites_needing_analysis)
+            if favorite_articles:
+                logger.info(f"Found {len(favorite_articles)} favorite articles needing analysis")
+                for fav in favorite_articles:
+                    analysis = await generate_favorite_analysis(fav)
+                    if analysis:
+                        await asyncio.to_thread(supabase_manager.update_favorite_analysis, fav.id, analysis)
+            else:
+                logger.info("No favorite articles pending analysis")
+        except Exception as e:
+            logger.warning(f"Favorite analysis failed: {e}")
 
     end_time = datetime.now()
     duration = end_time - start_time

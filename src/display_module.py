@@ -410,41 +410,23 @@ class DisplayModule:
             // 调用 Edge Function
             async function processFavorite() {{
               try {{
-                // 尝试匿名登录获取 JWT
-                const {{ data: {{ user }}, error: authError }} = await supabase.auth.signInAnonymously();
-                
-                if (authError || !user) {{
-                  // 如果匿名登录失败，直接调用（用 service role）
-                  const response = await fetch(
-                    supabaseUrl + '/functions/v1/process-favorite',
-                    {{
-                      method: 'POST',
-                      headers: {{
-                        'Authorization': 'Bearer ' + supabaseKey,
-                        'Content-Type': 'application/json'
-                      }},
-                      body: JSON.stringify({{ article_id: id }})
-                    }}
-                  );
-                  const result = await response.json();
-                  if (result.success) {{
-                    document.body.innerHTML = '<h3>收藏成功，简析已生成</h3><p>' + (result.plain_summary || '') + '</p>';
-                  }} else {{
-                    document.body.innerHTML = '<h3>处理失败: ' + (result.error || '未知错误') + '</h3>';
+                // 直接调用（用 service role + API key）
+                const response = await fetch(
+                  supabaseUrl + '/functions/v1/process-favorite?api_key=default-api-key',
+                  {{
+                    method: 'POST',
+                    headers: {{
+                      'Authorization': 'Bearer ' + supabaseKey,
+                      'Content-Type': 'application/json'
+                    }},
+                    body: JSON.stringify({{ article_id: id }})
                   }}
+                );
+                const result = await response.json();
+                if (result.success) {{
+                  document.body.innerHTML = '<h3>收藏成功，简析已生成</h3><p>' + (result.plain_summary || '') + '</p>';
                 }} else {{
-                  // 匿名登录成功，用 JWT 调用
-                  const {{ data, error }} = await supabase.functions.invoke('process-favorite', {{
-                    body: {{ article_id: id }}
-                  }});
-                  
-                  if (error) {{
-                    document.body.innerHTML = '<h3>错误: ' + error.message + '</h3>';
-                  }} else if (data && data.success) {{
-                    document.body.innerHTML = '<h3>收藏成功，简析已生成</h3><p>' + (data.plain_summary || '') + '</p>';
-                  }} else {{
-                    document.body.innerHTML = '<h3>处理失败</h3>';
-                  }}
+                  document.body.innerHTML = '<h3>处理失败: ' + (result.error || '未知错误') + '</h3>';
                 }}
               }} catch (err) {{
                 document.body.innerHTML = '<h3>错误: ' + err.message + '</h3>';

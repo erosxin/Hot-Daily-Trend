@@ -1,0 +1,1669 @@
+From 2104f99321697f553117d4ce22b4847895d1f2fd Mon Sep 17 00:00:00 2001
+From: Bernardo <bernardo@psygoai.com>
+Date: Sat, 24 Jan 2026 11:41:17 +0800
+Subject: [PATCH 1/2] Fix Supabase upsert with schema filtering and REST
+
+---
+ src/supabase_manager.py | 625 ++++++++++------------------------------
+ 1 file changed, 150 insertions(+), 475 deletions(-)
+
+diff --git a/src/supabase_manager.py b/src/supabase_manager.py
+index 85c3735..eb5bd72 100644
+--- a/src/supabase_manager.py
++++ b/src/supabase_manager.py
+@@ -1,531 +1,206 @@
+-import os
+ import logging
+-from typing import List, Dict, Any, Tuple
++import json
++from typing import List, Dict, Any, Tuple, Set
+ from datetime import datetime, timedelta
++
++import httpx
+ from supabase import create_client, Client
+-import json
+ 
+ from src.data_models import Article
+ from src.config import settings
+ 
+ logger = logging.getLogger(__name__)
+-# Ensure DEBUG level logs are visible when DEBUG mode is enabled
+ logger.setLevel(logging.DEBUG if settings.DEBUG else logging.INFO)
+ 
++
+ class SupabaseManager:
+-    """
+-    Manages interactions with Supabase, including client initialization and
+-    upserting Article data.
+-    """
+     def __init__(self, use_service_role: bool = True):
+-        """
+-        Initialize SupabaseManager.
+-        
+-        Args:
+-            use_service_role: If True, use service_role key (bypasses RLS).
+-                            If False, use anon key (subject to RLS).
+-        """
+         self.supabase_url = settings.SUPABASE_URL
+-        
+-        # Determine which key to use
++
+         if use_service_role:
+-            # Prefer SUPABASE_SERVICE_ROLE_KEY, fallback to SUPABASE_KEY if it's service_role
+-            if hasattr(settings, 'SUPABASE_SERVICE_ROLE_KEY') and settings.SUPABASE_SERVICE_ROLE_KEY:
++            if getattr(settings, "SUPABASE_SERVICE_ROLE_KEY", None):
+                 self.supabase_key = settings.SUPABASE_SERVICE_ROLE_KEY
+                 key_type = "service_role"
+-            elif settings.supabase_key_type.startswith("service_role"):
+-                self.supabase_key = settings.SUPABASE_KEY
+-                key_type = "service_role"
+             else:
+-                # If no service_role key available, warn but continue
+-                logger.warning("Service role key not found, using available key. RLS may block operations.")
+                 self.supabase_key = settings.SUPABASE_KEY
+                 key_type = settings.supabase_key_type
+         else:
+-            # Use anon key
+-            if hasattr(settings, 'SUPABASE_ANON_KEY') and settings.SUPABASE_ANON_KEY:
++            if getattr(settings, "SUPABASE_ANON_KEY", None):
+                 self.supabase_key = settings.SUPABASE_ANON_KEY
+                 key_type = "anon"
+             else:
+                 self.supabase_key = settings.SUPABASE_KEY
+                 key_type = settings.supabase_key_type
+-        
++
+         self.table_name = settings.SUPABASE_TABLE_ARTICLES
+ 
+         if not self.supabase_url or not self.supabase_key or not self.table_name:
+-            logger.error("Supabase URL, Key, or Table Name is not configured in settings.")
+             raise ValueError("Supabase configuration is incomplete.")
+-        
++
++        self.client: Client = create_client(self.supabase_url, self.supabase_key)
++        logger.info(f"Supabase client initialized successfully with {key_type} key.")
++
++        self.allowed_columns: Set[str] = self._fetch_table_columns()
++
++    def _fetch_table_columns(self) -> Set[str]:
++        """Fetch table schema from PostgREST OpenAPI and cache allowed columns."""
+         try:
+-            self.client: Client = create_client(self.supabase_url, self.supabase_key)
+-            logger.info(f"Supabase client initialized successfully with {key_type} key.")
+-            logger.debug(f"Using Supabase key type: {key_type}, URL: {self.supabase_url[:40]}...")
++            base_url = self.supabase_url.replace("http://", "https://").rstrip("/")
++            openapi_url = f"{base_url}/rest/v1/?apikey={self.supabase_key}"
++            resp = httpx.get(openapi_url, timeout=10)
++            resp.raise_for_status()
++            openapi = resp.json()
++            definition = openapi.get("definitions", {}).get(self.table_name, {})
++            props = definition.get("properties", {})
++            columns = set(props.keys())
++            if columns:
++                logger.info(f"Detected {len(columns)} columns in Supabase table '{self.table_name}'.")
++            else:
++                logger.warning("Could not detect table columns from OpenAPI schema.")
++            return columns
+         except Exception as e:
+-            logger.error(f"Failed to initialize Supabase client: {e}", exc_info=True)
+-            raise
++            logger.warning(f"Failed to fetch Supabase schema, skip column filtering: {e}")
++            return set()
++
++    def _filter_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
++        if not self.allowed_columns:
++            return payload
++        filtered = {k: v for k, v in payload.items() if k in self.allowed_columns}
++        dropped = set(payload.keys()) - set(filtered.keys())
++        if dropped:
++            logger.debug(f"Dropped fields not in table schema: {sorted(dropped)}")
++        return filtered
+ 
+     def _article_to_dict(self, article: Article) -> Dict[str, Any]:
+-        """
+-        Converts an Article Pydantic model to a dictionary suitable for Supabase insertion.
+-        Handles nested structures and type conversions.
+-        """
+-        try:
+-            # Use model_dump() for Pydantic v2+, fallback to dict() for v1
+-            if hasattr(article, 'model_dump'):
+-                article_dict = article.model_dump()
+-            else:
+-                article_dict = article.dict()
+-            
+-            # Convert HttpUrl to string
+-            if article_dict.get('link'):
+-                article_dict['link'] = str(article_dict['link'])
+-            if article_dict.get('image_url'):
+-                article_dict['image_url'] = str(article_dict['image_url'])
++        if hasattr(article, "model_dump"):
++            article_dict = article.model_dump()
++        else:
++            article_dict = article.dict()
+ 
+-            # Convert datetime objects to ISO format strings
+-            if article_dict.get('published'):
+-                article_dict['published'] = article_dict['published'].isoformat()
+-            if article_dict.get('created_at'):
+-                article_dict['created_at'] = article_dict['created_at'].isoformat()
+-            if article_dict.get('updated_at'):
+-                article_dict['updated_at'] = article_dict['updated_at'].isoformat()
++        if article_dict.get("link"):
++            article_dict["link"] = str(article_dict["link"])
++        if article_dict.get("image_url"):
++            article_dict["image_url"] = str(article_dict["image_url"])
+ 
+-            # Handle list/dict fields for Supabase jsonb columns
+-            # IMPORTANT: Supabase Python SDK expects native Python types (list, dict) for jsonb columns
+-            # It will automatically serialize them to JSON. Using json.dumps() here would create
+-            # a string instead of jsonb, which may cause issues.
+-            # 
+-            # However, we need to ensure the data is in the correct format:
+-            # - Lists should be Python lists
+-            # - Dicts should be Python dicts
+-            # - None values should remain None (Supabase handles NULL)
+-            
+-            # Verify and log the types of jsonb fields
+-            if article_dict.get('tags') is not None:
+-                if not isinstance(article_dict['tags'], list):
+-                    logger.warning(f"tags is not a list: {type(article_dict['tags'])}. Converting...")
+-                    article_dict['tags'] = list(article_dict['tags']) if article_dict['tags'] else []
+-            if article_dict.get('main_tags') is not None:
+-                if not isinstance(article_dict['main_tags'], list):
+-                    logger.warning(f"main_tags is not a list: {type(article_dict['main_tags'])}. Converting...")
+-                    article_dict['main_tags'] = list(article_dict['main_tags']) if article_dict['main_tags'] else []
+-            
+-            # --- IMPORTANT: Handle entities type change ---
+-            # entities is now Dict[str, List[str]], should be a Python dict for jsonb
+-            if article_dict.get('entities') is not None:
+-                if not isinstance(article_dict['entities'], dict):
+-                    logger.warning(f"entities is not a dict: {type(article_dict['entities'])}. Converting...")
+-                    article_dict['entities'] = dict(article_dict['entities']) if article_dict['entities'] else {}
++        if not article_dict.get("id") and article_dict.get("link"):
++            import uuid
++            article_dict["id"] = str(uuid.uuid4())
+ 
+-            if article_dict.get('authors') is not None:
+-                if not isinstance(article_dict['authors'], list):
+-                    logger.warning(f"authors is not a list: {type(article_dict['authors'])}. Converting...")
+-                    article_dict['authors'] = list(article_dict['authors']) if article_dict['authors'] else []
+-            if article_dict.get('sentiment') is not None:
+-                if not isinstance(article_dict['sentiment'], dict):
+-                    logger.warning(f"sentiment is not a dict: {type(article_dict['sentiment'])}. Converting...")
+-                    article_dict['sentiment'] = dict(article_dict['sentiment']) if article_dict['sentiment'] else {}
++        for dt_field in ["published", "created_at", "updated_at"]:
++            if article_dict.get(dt_field) and hasattr(article_dict[dt_field], "isoformat"):
++                article_dict[dt_field] = article_dict[dt_field].isoformat()
+ 
+-            # Final validation: ensure all jsonb fields are native Python types
+-            jsonb_fields = ['tags', 'main_tags', 'entities', 'authors', 'sentiment']
+-            for field in jsonb_fields:
+-                if field in article_dict and article_dict[field] is not None:
+-                    value = article_dict[field]
+-                    # If it's a string (from json.dumps), parse it back
+-                    if isinstance(value, str):
+-                        try:
+-                            article_dict[field] = json.loads(value)
+-                            logger.debug(f"Parsed {field} from JSON string back to Python object")
+-                        except json.JSONDecodeError:
+-                            logger.warning(f"Failed to parse {field} from JSON string: {value[:100]}")
+-                    # Ensure it's the correct type
+-                    if field in ['tags', 'main_tags', 'authors'] and not isinstance(article_dict[field], list):
+-                        logger.warning(f"{field} is not a list after conversion: {type(article_dict[field])}")
+-                    elif field in ['entities', 'sentiment'] and not isinstance(article_dict[field], dict):
+-                        logger.warning(f"{field} is not a dict after conversion: {type(article_dict[field])}")
+-            
+-            logger.debug(f"Converted article to dict for Supabase: {article_dict.get('title')}")
+-            return article_dict
+-        except Exception as e:
+-            logger.error(f"Error converting Article to dict for Supabase: {e}", exc_info=True)
+-            logger.error(f"Problematic article data (title/link): {article.title} / {article.link}")
+-            raise
++        jsonb_fields = ["tags", "main_tags", "entities", "authors", "sentiment", "key_points"]
++        for field in jsonb_fields:
++            if field in article_dict and article_dict[field] is None:
++                continue
++            if field in ["tags", "main_tags", "authors", "key_points"] and not isinstance(article_dict.get(field, []), list):
++                article_dict[field] = list(article_dict[field]) if article_dict[field] else []
++            if field in ["entities", "sentiment"] and not isinstance(article_dict.get(field, {}), dict):
++                article_dict[field] = dict(article_dict[field]) if article_dict[field] else {}
++
++        return article_dict
++
++    def _rest_upsert(self, payload: List[Dict[str, Any]]) -> Tuple[int, int]:
++        base_url = self.supabase_url.replace("http://", "https://").rstrip("/")
++        url = f"{base_url}/rest/v1/{self.table_name}?on_conflict=link"
++        headers = {
++            "apikey": self.supabase_key,
++            "Authorization": f"Bearer {self.supabase_key}",
++            "Content-Type": "application/json",
++            "Prefer": "resolution=merge-duplicates,return=representation",
++        }
++        resp = httpx.post(url, headers=headers, json=payload, timeout=20)
++        if resp.status_code not in (200, 201):
++            logger.error(f"Supabase upsert failed: {resp.status_code} {resp.text}")
++            return 0, len(payload)
++        try:
++            data = resp.json()
++        except Exception:
++            data = []
++        inserted = len(data) if isinstance(data, list) else 0
++        skipped = len(payload) - inserted
++        return inserted, skipped
+ 
+     def upsert_articles(self, articles: List[Article]) -> Tuple[int, int]:
+-        """
+-        Upserts a list of Article objects into the Supabase table.
+-        Uses the 'link' as the unique identifier for conflict resolution.
+-        
+-        Args:
+-            articles: A list of Article Pydantic models.
+-            
+-        Returns:
+-            A tuple (inserted_count, skipped_count) indicating the number of
+-            successfully inserted/updated articles and skipped articles.
+-        """
+         if not articles:
+-            logger.info("No articles to upsert to Supabase.")
+             return 0, 0
+ 
+-        # ====================================================================
+-        # DEDUPLICATION: Remove duplicate articles based on 'link' field
+-        # ====================================================================
+-        logger.info("=" * 70)
+-        logger.info("🔄 DEDUPLICATION: Removing duplicate articles based on 'link' field")
+-        logger.info("=" * 70)
+-        original_count = len(articles)
+-        
+-        seen_links = set()
++        seen = set()
+         unique_articles = []
+-        skipped_empty_link = 0
+-        
+         for article in articles:
+-            # Convert link to string for comparison (handles HttpUrl type)
+             link_str = str(article.link) if article.link else None
+-            
+             if not link_str:
+-                # Skip articles with empty or None link
+-                skipped_empty_link += 1
+-                logger.debug(f"Skipping article due to empty link: {article.title if hasattr(article, 'title') else 'N/A'}")
+                 continue
+-            
+-            # Check if we've seen this link before
+-            if link_str not in seen_links:
+-                seen_links.add(link_str)
+-                unique_articles.append(article)
+-            else:
+-                logger.debug(f"Skipping duplicate article with link: {link_str[:80]}...")
+-        
+-        unique_count = len(unique_articles)
+-        duplicate_count = original_count - unique_count - skipped_empty_link
+-        
+-        logger.info(f"Original articles: {original_count}")
+-        logger.info(f"Unique articles (after deduplication): {unique_count}")
+-        logger.info(f"Duplicates removed: {duplicate_count}")
+-        logger.info(f"Articles with empty link (skipped): {skipped_empty_link}")
+-        logger.info("=" * 70)
+-        
++            if link_str in seen:
++                continue
++            seen.add(link_str)
++            unique_articles.append(article)
++
+         if not unique_articles:
+-            logger.warning("No unique articles to upsert to Supabase after deduplication.")
+-            return 0, original_count
+-        
+-        # Update articles list to use deduplicated articles
+-        articles = unique_articles
+-        # ====================================================================
+-        
+-        # ====================================================================
+-        # DEBUGGING MODE: Minimal field insertion test
+-        # ====================================================================
+-        # We're temporarily only inserting the 'title' field to isolate the issue.
+-        # If this succeeds, we'll gradually add more fields one by one.
+-        # ====================================================================
+-        logger.info("=" * 70)
+-        logger.info("🔍 MINIMAL FIELD TEST MODE")
+-        logger.info("=" * 70)
+-        logger.info("Currently only inserting 'title' field to test basic insertion.")
+-        logger.info("If this succeeds, we'll add fields one by one until we find the problematic field.")
+-        logger.info("=" * 70)
+-        
+-        articles_to_upsert = []
+-        for article in articles:
++            return 0, len(articles)
++
++        payload = []
++        for article in unique_articles:
+             try:
+-                # Include all fields that may be needed for Supabase table
+-                # Note: 'id' field is auto-generated by Supabase, we don't need to provide it
+-                article_dict = {
+-                    "title": article.title if article.title else None,
+-                    "link": str(article.link) if article.link else None,
+-                    "published": article.published.isoformat() if article.published else None,  # Convert datetime to ISO 8601 format
+-                    "summary": article.summary if article.summary else None
+-                }
+-                
+-                # Validate at least title is not None or empty
+-                if not article_dict["title"]:
+-                    logger.warning(f"Skipping article with None or empty title: {str(article.link)[:80] if article.link else 'N/A'}...")
+-                    continue
+-                
+-                articles_to_upsert.append(article_dict)
++                article_dict = self._article_to_dict(article)
++                article_dict = self._filter_payload(article_dict)
++                payload.append(article_dict)
+             except Exception as e:
+-                logger.warning(f"Skipping article due to conversion error: {str(article.link)[:80] if article.link else 'N/A'}... - {e}")
+-                continue
++                logger.warning(f"Skip article due to conversion error: {e}")
+ 
+-        if not articles_to_upsert:
+-            logger.warning("All articles were skipped due to conversion errors. No data to upsert.")
+-            return 0, len(articles) # All original articles were skipped
++        if not payload:
++            return 0, len(unique_articles)
+ 
+-        inserted_count = 0
+-        skipped_count = 0 # Articles that caused an error during upsert or already existed and were not updated (if RLS prevents update)
++        return self._rest_upsert(payload)
+ 
+-        logger.info(f"Attempting to prepare {len(articles_to_upsert)} articles for Supabase table '{self.table_name}'...")
+-        
+-        # 验证所有文章都有 title 字段（title 是必需的）
+-        articles_without_title = [i for i, a in enumerate(articles_to_upsert) if not a.get('title')]
+-        if articles_without_title:
+-            logger.error(f"Found {len(articles_without_title)} articles without 'title' field. Indices: {articles_without_title[:10]}")
+-            articles_to_upsert = [a for a in articles_to_upsert if a.get('title')]
+-            if not articles_to_upsert:
+-                logger.error("No articles with valid 'title' field remaining. Cannot proceed.")
+-                return 0, len(articles)
+-            logger.warning(f"Proceeding with {len(articles_to_upsert)} articles that have valid 'title' field.")
+-        
+-        # 验证字段类型和格式
+-        logger.info("=" * 70)
+-        logger.info("VALIDATION (all fields: title, link, published, summary)")
+-        logger.info("=" * 70)
+-        validated_articles = []
+-        for i, article_dict in enumerate(articles_to_upsert):
+-            # Validate title (required)
+-            if not article_dict.get('title'):
+-                logger.warning(f"Article {i} missing 'title' field, skipping")
+-                continue
+-            if not isinstance(article_dict['title'], str):
+-                logger.warning(f"Article {i} 'title' is not a string: {type(article_dict['title'])}, skipping")
+-                continue
+-            
+-            # Validate link (optional but should be string if present)
+-            if article_dict.get('link') is not None and not isinstance(article_dict['link'], str):
+-                logger.warning(f"Article {i} 'link' is not a string: {type(article_dict['link'])}, converting...")
+-                article_dict['link'] = str(article_dict['link'])
+-            
+-            # Validate published (optional but should be ISO string if present)
+-            if article_dict.get('published') is not None and not isinstance(article_dict['published'], str):
+-                logger.warning(f"Article {i} 'published' is not a string: {type(article_dict['published'])}, skipping")
+-                continue
+-            
+-            # Validate summary (optional, can be None or string)
+-            if article_dict.get('summary') is not None and not isinstance(article_dict['summary'], str):
+-                logger.warning(f"Article {i} 'summary' is not a string: {type(article_dict['summary'])}, setting to None")
+-                article_dict['summary'] = None
+-            
+-            validated_articles.append(article_dict)
+-        
+-        if len(validated_articles) != len(articles_to_upsert):
+-            logger.warning(f"Validated {len(validated_articles)} articles out of {len(articles_to_upsert)} original articles")
+-            articles_to_upsert = validated_articles
+-        
+-        logger.info(f"✅ Validation complete: {len(validated_articles)} articles ready for JSON export (all fields)")
+-        logger.info("=" * 70)
+-        
+-        if not articles_to_upsert:
+-            logger.error("No valid articles to insert after validation")
+-            return 0, len(articles)
+-        
+-        # 详细日志：打印待插入的数据（所有字段）
+-        logger.info("=" * 70)
+-        logger.info("DATA TO EXPORT (all fields: title, link, published, summary)")
+-        logger.info("=" * 70)
+-        if articles_to_upsert:
+-            # 打印前 5 个文章的 JSON 数据
+-            for i, article_data in enumerate(articles_to_upsert[:5]):
+-                logger.info(f"\n--- Article {i+1} of {len(articles_to_upsert)} ---")
+-                try:
+-                    json_str = json.dumps(article_data, indent=2, ensure_ascii=False, default=str)
+-                    logger.info(json_str)
+-                except Exception as json_e:
+-                    logger.error(f"Failed to serialize article {i+1} to JSON: {json_e}")
+-                    logger.info(f"Article {i+1} data (raw dict): {article_data}")
+-            
+-            logger.info(f"\n--- Summary ---")
+-            logger.info(f"Total articles to insert: {len(articles_to_upsert)}")
+-            logger.info(f"Fields being inserted: {list(articles_to_upsert[0].keys()) if articles_to_upsert else 'N/A'}")
+-            logger.info(f"First article title: {articles_to_upsert[0].get('title', 'N/A')[:80] if articles_to_upsert else 'N/A'}")
+-        logger.info("=" * 70)
+-        
+-        logger.info("=" * 70)
+-        logger.info("IMPORTANT NOTES FOR JSON EXPORT:")
+-        logger.info("1. All fields (title, link, published, summary) are being exported to JSON")
+-        logger.info("2. 'id' field is NOT included (Supabase will auto-generate it)")
+-        logger.info("3. 'published' is converted to ISO 8601 format string")
+-        logger.info("4. 'link' is converted to string (handles HttpUrl type)")
+-        logger.info("5. Data will be saved to 'articles_to_insert.json' for analysis")
+-        logger.info("6. Supabase INSERT operation is temporarily disabled")
+-        logger.info("=" * 70)
+-        
+-        # DEBUGGING: Temporarily use INSERT instead of UPSERT to test if data can be inserted
+-        # This helps us understand if the issue is with upsert logic or data format
+-        # IMPORTANT: Ensure the table is empty before running this test
+-        logger.info("=" * 70)
+-        logger.info("DEBUGGING MODE: Using INSERT instead of UPSERT")
+-        logger.info("This is a temporary change to diagnose the issue.")
+-        logger.info("Please ensure the 'articles' table is empty before running.")
+-        logger.info("=" * 70)
+-        logger.info("⚠️  IMPORTANT: Try-except block has been REMOVED for debugging.")
+-        logger.info("Any errors will now be raised directly to help identify the issue.")
+-        logger.info("=" * 70)
+-        
+-        logger.info(f"Calling Supabase INSERT (not UPSERT) for {len(articles_to_upsert)} articles...")
+-        logger.info(f"Table name: '{self.table_name}'")
+-        logger.info(f"First article title: {articles_to_upsert[0].get('title', 'N/A')[:80] if articles_to_upsert else 'N/A'}")
+-        
+-        # Use insert() instead of upsert() for debugging
+-        # This will fail if there are duplicates, but will give us clearer error messages
+-        # NOTE: Try-except has been removed - errors will be raised directly
+-        
+-        # ====================================================================
+-        # FORCE PRINT: 强制打印待插入数据的详细内容
+-        # ====================================================================
+-        print("\n" + "=" * 70)
+-        print("--- BEGIN DATA TO INSERT (FORCE PRINT) ---")
+-        print("=" * 70)
+-        if articles_to_upsert:
+-            print(f"Total articles to insert (after deduplication): {len(articles_to_upsert)}")
+-            print(f"Fields being inserted: {list(articles_to_upsert[0].keys()) if articles_to_upsert else 'N/A'}")
+-            print("\n--- Sample Articles (first 5) ---")
+-            for i, article_data in enumerate(articles_to_upsert[:5]):
+-                print(f"\n--- Article {i+1} of {len(articles_to_upsert)} ---")
++    def fetch_articles(self, limit: int = 100, days_ago: int = 7) -> List[Article]:
++        cutoff_date = datetime.utcnow() - timedelta(days=days_ago)
++        response = self.client.table(self.table_name) \
++            .select("*") \
++            .gte("published", cutoff_date.isoformat()) \
++            .order("published", desc=True) \
++            .limit(limit) \
++            .execute()
++
++        articles: List[Article] = []
++        if hasattr(response, "data") and response.data:
++            for item in response.data:
++                for field in ["tags", "main_tags", "entities", "authors", "sentiment", "key_points"]:
++                    if field in item and isinstance(item[field], str):
++                        try:
++                            item[field] = json.loads(item[field])
++                        except Exception:
++                            pass
+                 try:
+-                    json_str = json.dumps(article_data, indent=2, ensure_ascii=False, default=str)
+-                    print(json_str)
+-                except Exception as json_e:
+-                    print(f"Failed to serialize article {i+1} to JSON: {json_e}")
+-                    print(f"Article {i+1} data (raw dict): {article_data}")
+-            if len(articles_to_upsert) > 5:
+-                print(f"\n... (and {len(articles_to_upsert) - 5} more articles)")
+-        else:
+-            print("WARNING: articles_to_upsert is empty!")
+-        print("=" * 70)
+-        print("--- END DATA TO INSERT (FORCE PRINT) ---")
+-        print("=" * 70 + "\n")
+-        # ====================================================================
+-        
+-        # ====================================================================
+-        # SAVE DATA TO LOCAL JSON FILE FOR ANALYSIS
+-        # ====================================================================
+-        output_filename = "articles_to_insert.json"
+-        try:
+-            with open(output_filename, 'w', encoding='utf-8') as f:
+-                json.dump(articles_to_upsert, f, ensure_ascii=False, indent=2, default=str)
+-            logger.info("=" * 70)
+-            logger.info(f"✅ Successfully saved {len(articles_to_upsert)} articles to {output_filename}")
+-            logger.info(f"File location: {os.path.abspath(output_filename)}")
+-            logger.info("=" * 70)
+-        except Exception as e:
+-            logger.error(f"❌ Failed to save articles to JSON file: {e}", exc_info=True)
+-        # ====================================================================
+-        
+-        # ====================================================================
+-        # TEMPORARILY COMMENTED OUT: Supabase INSERT operation
+-        # We're saving data to JSON file first for analysis
+-        # ====================================================================
+-        logger.info("⚠️  Supabase INSERT operation is temporarily COMMENTED OUT.")
+-        logger.info("Data has been saved to articles_to_insert.json for analysis.")
+-        logger.info("After reviewing the JSON file, we can uncomment the INSERT code below.")
+-        logger.info("=" * 70)
+-        
+-        logger.info("Executing Supabase INSERT operation...")
+-        response = self.client.table(self.table_name).insert(articles_to_upsert).execute()
+-        logger.info(f"Supabase INSERT call completed. Response type: {type(response)}")
+-        
+-        # The Supabase client's execute() method returns a Response object
+-        # The actual data is in response.data
+-        # The data contains the inserted/updated rows.
+-        
+-        # 详细日志：打印完整的响应信息
+-        logger.info("=" * 70)
+-        logger.info("SUPABASE INSERT RESPONSE DETAILS")
+-        logger.info("=" * 70)
+-        logger.info(f"Response object type: {type(response)}")
+-        logger.info(f"Response object attributes: {[attr for attr in dir(response) if not attr.startswith('_')]}")
+-        logger.info(f"Response has 'data' attribute: {hasattr(response, 'data')}")
+-        logger.info(f"Response has 'count' attribute: {hasattr(response, 'count')}")
+-        
+-        # 检查 HTTP 状态码（如果可用）
+-        if hasattr(response, 'status_code'):
+-            logger.info(f"HTTP Status Code: {response.status_code}")
+-        if hasattr(response, 'status_text'):
+-            logger.info(f"HTTP Status Text: {response.status_text}")
+-        
+-        if hasattr(response, 'data'):
+-            logger.info(f"Response.data type: {type(response.data)}")
+-            if response.data is not None:
+-                if isinstance(response.data, list):
+-                    logger.info(f"Response.data length: {len(response.data)}")
+-                    if len(response.data) > 0:
+-                        logger.info(f"First returned article keys: {list(response.data[0].keys()) if isinstance(response.data[0], dict) else 'N/A'}")
+-                        logger.info(f"\n--- First Returned Article (JSON) ---")
++                    articles.append(Article(**item))
++                except Exception as e:
++                    logger.warning(f"Failed to parse article from Supabase: {e}")
++        return articles
++
++    def fetch_favorites_needing_analysis(self, limit: int = 50) -> List[Article]:
++        response = self.client.table(self.table_name) \
++            .select("*") \
++            .eq("is_favorite", True) \
++            .is_("favorite_analysis", "null") \
++            .order("updated_at", desc=True) \
++            .limit(limit) \
++            .execute()
++
++        articles: List[Article] = []
++        if hasattr(response, "data") and response.data:
++            for item in response.data:
++                for field in ["tags", "main_tags", "entities", "authors", "sentiment", "key_points"]:
++                    if field in item and isinstance(item[field], str):
+                         try:
+-                            first_returned_json = json.dumps(response.data[0], indent=2, ensure_ascii=False, default=str)
+-                            logger.info(first_returned_json)
+-                        except Exception as json_e:
+-                            logger.warning(f"Failed to serialize returned article to JSON: {json_e}")
+-                            logger.info(f"First returned article (raw): {response.data[0]}")
+-                    else:
+-                        logger.warning("Response.data is an empty list")
+-                else:
+-                    logger.warning(f"Response.data is not a list: {type(response.data)}")
+-                    logger.info(f"Response.data value: {response.data}")
+-            else:
+-                logger.warning("Response.data is None")
+-        else:
+-            logger.error("Response object does not have 'data' attribute")
+-        
+-        logger.info("=" * 70)
+-        
+-        # Check for errors in the response
+-        if hasattr(response, 'data') and response.data is not None:
+-            if isinstance(response.data, list):
+-                inserted_count = len(response.data)
+-                logger.info(f"✅ Successfully INSERTED {inserted_count} articles to Supabase.")
+-                skipped_count = len(articles_to_upsert) - inserted_count
+-                return inserted_count, skipped_count
+-            else:
+-                logger.warning(f"Response.data is not a list: {type(response.data)}")
+-                return 0, len(articles_to_upsert)
+-        else:
+-            logger.warning("Response.data is None or missing. No articles were inserted.")
+-            return 0, len(articles_to_upsert)
+-        
+-        # NOTE: Try-except block has been REMOVED for debugging purposes.
+-        # Any exceptions from Supabase INSERT will now be raised directly,
+-        # allowing us to see the full error stack trace and identify the root cause.
+-        # 
+-        # If an exception occurs, check:
+-        # 1. Python console output for the full exception traceback
+-        # 2. Supabase Dashboard -> Logs -> Database Logs for PostgreSQL error messages
+-        # 3. The detailed data logs printed above to verify data format
+-
+-    def fetch_articles(self, limit: int = 100, days_ago: int = 7) -> List[Article]:
+-        """
+-        Fetches articles from Supabase within a specified date range.
+-        
+-        Args:
+-            limit: Maximum number of articles to fetch.
+-            days_ago: Fetch articles published within the last N days.
+-            
+-        Returns:
+-            A list of Article objects.
+-        """
+-        try:
+-            # Calculate the cutoff date
+-            cutoff_date = datetime.utcnow() - timedelta(days=days_ago)
+-            
+-            response = self.client.table(self.table_name) \
+-                .select("*") \
+-                .gte("published", cutoff_date.isoformat()) \
+-                .order("published", desc=True) \
+-                .limit(limit) \
+-                .execute()
+-            
+-            articles = []
+-            if hasattr(response, 'data') and response.data:
+-                for item in response.data:
+-                    try:
+-                        # Re-parse JSON fields back into Python objects
+-                        if 'tags' in item and isinstance(item['tags'], str):
+-                            item['tags'] = json.loads(item['tags'])
+-                        if 'main_tags' in item and isinstance(item['main_tags'], str):
+-                            item['main_tags'] = json.loads(item['main_tags'])
+-                        if 'entities' in item and isinstance(item['entities'], str):
+-                            item['entities'] = json.loads(item['entities'])
+-                        if 'authors' in item and isinstance(item['authors'], str):
+-                            item['authors'] = json.loads(item['authors'])
+-                        if 'sentiment' in item and isinstance(item['sentiment'], str):
+-                            item['sentiment'] = json.loads(item['sentiment'])
++                            item[field] = json.loads(item[field])
++                        except Exception:
++                            pass
++                try:
++                    articles.append(Article(**item))
++                except Exception as e:
++                    logger.warning(f"Failed to parse favorite article: {e}")
++        return articles
+ 
+-                        articles.append(Article(**item))
+-                    except Exception as e:
+-                        logger.warning(f"Failed to convert fetched data to Article object: {e}. Data: {item.get('link')}")
+-            logger.info(f"Fetched {len(articles)} articles from Supabase.")
+-            return articles
+-        except Exception as e:
+-            logger.error(f"Error fetching articles from Supabase: {e}", exc_info=True)
+-            return []
++    def update_favorite_analysis(self, article_id: str, analysis: str) -> None:
++        self.client.table(self.table_name).update({"favorite_analysis": analysis}).eq("id", article_id).execute()
+-- 
+2.47.3
+
+
+From 45d523727d4e0e216c53360431a0ea244576a446 Mon Sep 17 00:00:00 2001
+From: Bernardo <bernardo@psygoai.com>
+Date: Sat, 24 Jan 2026 13:24:24 +0800
+Subject: [PATCH 2/2] fix: supabase write + email sender + rss timeout
+
+---
+ .github/workflows/daily.yml |  43 ++++++
+ README.md                   |  25 +++
+ SUPABASE_SCHEMA_UPDATE.sql  |  21 +++
+ src/data_models.py          |   8 +
+ src/display_module.py       | 156 ++++++++++++++++++-
+ src/email_sender.py         |  30 ++++
+ src/main_scraper.py         |  97 +++++++-----
+ src/nlp_processor.py        | 298 ++++++++++++++++++++----------------
+ src/scrapers/rss_scraper.py |  45 ++++--
+ 9 files changed, 537 insertions(+), 186 deletions(-)
+ create mode 100644 .github/workflows/daily.yml
+ create mode 100644 SUPABASE_SCHEMA_UPDATE.sql
+ create mode 100644 src/email_sender.py
+
+diff --git a/.github/workflows/daily.yml b/.github/workflows/daily.yml
+new file mode 100644
+index 0000000..324fa8e
+--- /dev/null
++++ b/.github/workflows/daily.yml
+@@ -0,0 +1,43 @@
++name: Daily AI Trend
++
++on:
++  schedule:
++    - cron: "0 23 * * *" # 07:00 Beijing (UTC+8)
++  workflow_dispatch:
++
++jobs:
++  run:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Set up Python
++        uses: actions/setup-python@v5
++        with:
++          python-version: "3.11"
++
++      - name: Install dependencies
++        run: pip install -r requirements.txt
++
++      - name: Write env file
++        run: |
++          cat << 'EOF' > .env
++          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
++          SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
++          SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
++          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
++          SERPER_API_KEY=${{ secrets.SERPER_API_KEY }}
++          RESEND_API_KEY=${{ secrets.RESEND_API_KEY }}
++          RECIPIENT_EMAIL=${{ secrets.RECIPIENT_EMAIL }}
++          SENDER_EMAIL=${{ secrets.SENDER_EMAIL }}
++          GITHUB_PAGES_BASE_URL=${{ secrets.GITHUB_PAGES_BASE_URL }}
++          EOF
++
++      - name: Run scraper
++        run: python -m src.main_scraper
++
++      - name: Deploy to GitHub Pages
++        uses: peaceiris/actions-gh-pages@v4
++        with:
++          github_token: ${{ secrets.GITHUB_TOKEN }}
++          publish_dir: ./output
+diff --git a/README.md b/README.md
+index f6d2706..fa8daf7 100644
+--- a/README.md
++++ b/README.md
+@@ -199,6 +199,31 @@ Hot-Daily-Trend/
+ 
+ ### 常见错误
+ 
++## ✅ 新增功能（本次修复）
++- 中文简报 + 三条要点 + 趋势标签 + 热度分
++- 邮件汇总（Resend）
++- 静态页面 + 收藏入口（GitHub Pages）
++- 收藏后在下一次任务运行生成“简析”
++- 每天早上 7:00 北京时间自动运行（GitHub Actions）
++
++## 🧩 Supabase 表结构更新
++执行 `SUPABASE_SCHEMA_UPDATE.sql` 以增加新字段与 RLS policy。
++
++## 🔐 需要在 GitHub Secrets 中配置
++- SUPABASE_URL
++- SUPABASE_ANON_KEY
++- SUPABASE_SERVICE_ROLE_KEY
++- OPENAI_API_KEY
++- SERPER_API_KEY
++- RESEND_API_KEY
++- RECIPIENT_EMAIL
++- SENDER_EMAIL
++- GITHUB_PAGES_BASE_URL
++
++## 📧 Resend 发送方说明
++SENDER_EMAIL 必须是 Resend 中已验证的域名邮箱。
++
++
+ #### 1. ModuleNotFoundError: No module named 'src'
+ 
+ **原因**：直接运行 `python src/main_scraper.py` 时，Python 无法找到 `src` 模块。
+diff --git a/SUPABASE_SCHEMA_UPDATE.sql b/SUPABASE_SCHEMA_UPDATE.sql
+new file mode 100644
+index 0000000..8ecfb9f
+--- /dev/null
++++ b/SUPABASE_SCHEMA_UPDATE.sql
+@@ -0,0 +1,21 @@
++-- Add columns for new NLP fields and favorites
++alter table public.articles
++  add column if not exists summary_zh text,
++  add column if not exists key_points jsonb,
++  add column if not exists trend_tag text,
++  add column if not exists heat_score numeric,
++  add column if not exists is_favorite boolean default false,
++  add column if not exists favorite_analysis text;
++
++-- RLS policies for public favorite update (anon key)
++-- Enable RLS if not already enabled
++alter table public.articles enable row level security;
++
++-- Allow public read
++create policy if not exists "public_select" on public.articles
++  for select using (true);
++
++-- Allow public to set favorites (simple policy)
++create policy if not exists "public_favorite_update" on public.articles
++  for update using (true)
++  with check (is_favorite = true);
+diff --git a/src/data_models.py b/src/data_models.py
+index 4bd54e0..ea55d89 100644
+--- a/src/data_models.py
++++ b/src/data_models.py
+@@ -14,6 +14,14 @@ class Article(BaseModel):
+     source: str = Field(..., description="Source (e.g., website name, RSS feed title) of the article.")
+     summary: Optional[str] = Field(None, min_length=20, description="Generated summary of the article content.")
+     content: Optional[str] = Field(None, description="Full or partial content of the article.")
++
++    summary_zh: Optional[str] = Field(None, min_length=10, description="中文简报")
++    is_favorite: bool = Field(False, description="是否收藏")
++
++    key_points: List[str] = Field(default_factory=list, description="三条要点（中文）")
++    trend_tag: Optional[str] = Field(None, description="趋势标签")
++    heat_score: Optional[float] = Field(None, description="热度评分 0-100")
++    favorite_analysis: Optional[str] = Field(None, description="收藏后AI简析（中文）")
+     image_url: Optional[HttpUrl] = Field(None, description="URL of the main image for the article.")
+     tags: List[str] = Field(default_factory=list, description="Keywords or categories associated with the article.")
+     main_tags: List[str] = Field(default_factory=list, description="Primary tags extracted from the article.")
+diff --git a/src/display_module.py b/src/display_module.py
+index 01e4d0c..5f7d5bf 100644
+--- a/src/display_module.py
++++ b/src/display_module.py
+@@ -2,6 +2,9 @@
+ import logging
+ from typing import List
+ from src.data_models import Article
++import os
++from pathlib import Path
++
+ from datetime import datetime, timezone
+ 
+ logger = logging.getLogger(__name__)
+@@ -238,7 +241,7 @@ class DisplayModule:
+             stats_output.append(f"\n### By Tag")
+             for tag, count in sorted(tag_counts.items(), key=lambda x: x[1], reverse=True):
+                 stats_output.append(f"- {tag}: {count}")
+-        
++
+         # 按实体统计（entities 现在是 Dict[str, List[str]]）
+         entity_counts = {}
+         for article in articles:
+@@ -246,10 +249,157 @@ class DisplayModule:
+                 for entity_type, entity_values in article.entities.items():
+                     for entity in entity_values:
+                         entity_counts[entity] = entity_counts.get(entity, 0) + 1
+-        
++
+         if entity_counts:
+             stats_output.append(f"\n### Top Entities")
+             for entity, count in sorted(entity_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
+                 stats_output.append(f"- {entity}: {count}")
+-        
++
+         return "\n".join(stats_output)
++
++    def generate_email_html(self, articles: List[Article], base_url: str) -> str:
++        if not articles:
++            return "<h2>今日暂无可用AI新闻</h2>"
++
++        # Sort by heat_score then published
++        def _published_ts(article: Article) -> float:
++            if not article.published:
++                return 0.0
++            if isinstance(article.published, datetime):
++                dt = article.published
++                if dt.tzinfo is None:
++                    dt = dt.replace(tzinfo=timezone.utc)
++                else:
++                    dt = dt.astimezone(timezone.utc)
++                return dt.timestamp()
++            if isinstance(article.published, str):
++                try:
++                    published_str = article.published.replace('Z', '+00:00')
++                    dt = datetime.fromisoformat(published_str).astimezone(timezone.utc)
++                    return dt.timestamp()
++                except Exception:
++                    return 0.0
++            return 0.0
++
++        def score_key(a: Article):
++            return (a.heat_score or 0, _published_ts(a))
++
++        top_articles = sorted(articles, key=score_key, reverse=True)
++
++        # Trend radar
++        trend_counts = {}
++        for a in articles:
++            tag = a.trend_tag or (a.main_tags[0] if a.main_tags else "其他")
++            trend_counts[tag] = trend_counts.get(tag, 0) + 1
++
++        trend_items = "".join([f"<li>{k}: {v}</li>" for k, v in sorted(trend_counts.items(), key=lambda x: x[1], reverse=True)])
++
++        rows = []
++        for a in top_articles:
++            heat = f"{int(a.heat_score)}" if a.heat_score is not None else "-"
++            summary = a.summary_zh or a.summary or ""
++            key_points = "".join([f"<li>{p}</li>" for p in (a.key_points or [])[:3]])
++            fav_link = f"{base_url}/favorite.html?id={a.id}" if a.id else "#"
++            rows.append(
++                f"""
++                <div style='padding:12px 0;border-bottom:1px solid #eee;'>
++                  <div style='font-size:16px;font-weight:600;margin-bottom:6px;'>{a.title}</div>
++                  <div style='color:#666;font-size:12px;margin-bottom:8px;'>来源: {a.source} | 热度: {heat}</div>
++                  <div style='font-size:14px;margin-bottom:6px;'>{summary}</div>
++                  <ul style='margin:4px 0 8px 18px;padding:0;'>{key_points}</ul>
++                  <div style='font-size:13px;'>
++                    <a href='{str(a.link)}' target='_blank'>查看原文</a> | 
++                    <a href='{fav_link}' target='_blank'>收藏并生成简析</a>
++                  </div>
++                </div>
++                """
++            )
++
++        html = f"""
++        <html><body style='font-family:Arial,Helvetica,sans-serif;'>
++          <h2>每日AI趋势简报</h2>
++          <h3>趋势雷达</h3>
++          <ul>{trend_items}</ul>
++          <h3>今日要闻</h3>
++          {''.join(rows)}
++        </body></html>
++        """
++        return html
++
++    def generate_static_site(self, output_dir: Path, articles: List[Article], base_url: str, supabase_url: str, supabase_anon_key: str) -> None:
++        output_dir.mkdir(parents=True, exist_ok=True)
++
++        # Main index page
++        items_html = []
++        for a in articles:
++            heat = f"{int(a.heat_score)}" if a.heat_score is not None else "-"
++            summary = a.summary_zh or a.summary or ""
++            fav_link = f"{base_url}/favorite.html?id={a.id}" if a.id else "#"
++            items_html.append(
++                f"""
++                <div class='item'>
++                  <div class='title'>{a.title}</div>
++                  <div class='meta'>来源: {a.source} | 热度: {heat}</div>
++                  <div class='summary'>{summary}</div>
++                  <div class='links'>
++                    <a href='{str(a.link)}' target='_blank'>查看原文</a>
++                    <a href='{fav_link}' target='_blank'>收藏并生成简析</a>
++                  </div>
++                </div>
++                """
++            )
++
++        index_html = f"""
++        <html>
++        <head>
++          <meta charset='utf-8' />
++          <title>AI Daily Trend</title>
++          <style>
++            body {{ font-family: Arial, sans-serif; margin: 24px; color: #111; }}
++            .item {{ padding: 12px 0; border-bottom: 1px solid #eee; }}
++            .title {{ font-size: 18px; font-weight: 600; margin-bottom: 6px; }}
++            .meta {{ font-size: 12px; color: #666; margin-bottom: 6px; }}
++            .summary {{ font-size: 14px; margin-bottom: 6px; }}
++            .links a {{ margin-right: 10px; }}
++          </style>
++        </head>
++        <body>
++          <h2>每日AI趋势简报</h2>
++          {''.join(items_html)}
++        </body>
++        </html>
++        """
++
++        (output_dir / "index.html").write_text(index_html, encoding="utf-8")
++
++        # Favorite handler page (static)
++        favorite_html = f"""
++        <html>
++        <head><meta charset='utf-8' /></head>
++        <body>
++          <h3>正在收藏...</h3>
++          <script>
++            const params = new URLSearchParams(window.location.search);
++            const id = params.get('id');
++            if (!id) {{ document.body.innerHTML = '<h3>缺少文章ID</h3>'; }}
++            const url = '{supabase_url}/rest/v1/articles?id=eq.' + encodeURIComponent(id);
++            fetch(url, {{
++              method: 'PATCH',
++              headers: {{
++                'apikey': '{supabase_anon_key}',
++                'Authorization': 'Bearer {supabase_anon_key}',
++                'Content-Type': 'application/json',
++                'Prefer': 'return=representation'
++              }},
++              body: JSON.stringify({{ is_favorite: true }})
++            }}).then(res => res.json()).then(data => {{
++              document.body.innerHTML = '<h3>收藏成功，简析将在下一次任务运行后生成</h3>';
++            }}).catch(err => {{
++              document.body.innerHTML = '<h3>收藏失败，请稍后重试</h3>';
++            }});
++          </script>
++        </body>
++        </html>
++        """
++
++        (output_dir / "favorite.html").write_text(favorite_html, encoding="utf-8")
+diff --git a/src/email_sender.py b/src/email_sender.py
+new file mode 100644
+index 0000000..c389b2c
+--- /dev/null
++++ b/src/email_sender.py
+@@ -0,0 +1,30 @@
++import logging
++import resend
++from src.config import settings
++
++logger = logging.getLogger(__name__)
++
++
++def send_daily_email(subject: str, html_body: str) -> None:
++    if not settings.RESEND_API_KEY:
++        raise ValueError("RESEND_API_KEY is missing")
++
++    if not settings.SENDER_EMAIL or not settings.RECIPIENT_EMAIL:
++        raise ValueError("SENDER_EMAIL or RECIPIENT_EMAIL is missing")
++
++    resend.api_key = settings.RESEND_API_KEY
++
++    recipients = [email.strip() for email in settings.RECIPIENT_EMAIL.split(",") if email.strip()]
++    if not recipients:
++        raise ValueError("RECIPIENT_EMAIL is missing or empty")
++
++    payload = {
++        "from": settings.SENDER_EMAIL,
++        "to": recipients,
++        "subject": subject,
++        "html": html_body,
++    }
++
++    logger.info("Sending email via Resend...")
++    resend.Emails.send(payload)
++    logger.info("Email sent.")
+diff --git a/src/main_scraper.py b/src/main_scraper.py
+index fdb54ad..4534bf5 100644
+--- a/src/main_scraper.py
++++ b/src/main_scraper.py
+@@ -17,6 +17,9 @@ from src.scrapers.serper_news_scraper import SerperNewsScraper
+ # Corrected NLP processor import
+ from src.nlp_processor import process_articles_batch as nlp_process_articles_batch
+ 
++from src.email_sender import send_daily_email
++from src.nlp_processor import generate_favorite_analysis
++
+ # Corrected DisplayModule import
+ from src.display_module import DisplayModule
+ 
+@@ -154,16 +157,38 @@ async def main():
+     logger.info(f"ArxivScraper task created for categories: {settings.ARXIV_CATEGORIES}")
+     
+     # RSSScraper
+-    rss_scraper = RSSScraper(feed_configs=rss_feed_configs)
++    rss_scraper = RSSScraper(
++        feed_configs=rss_feed_configs,
++        max_entries_per_feed=settings.MAX_ARTICLES_PER_FEED,
++        skip_full_content_for_arxiv=True
++    )
+     rss_task = collect_from_async_iterator(
+         rss_scraper.scrape_articles(days_ago=settings.DAYS_AGO, fetch_full_content=True)
+     )
+     scraper_tasks.append(rss_task)
+     logger.info(f"RSSScraper task created for {len(rss_feed_configs)} feeds")
+     
+-    # SerperNewsScraper - Note: This scraper only has a search() method, not scrape_articles()
+-    # We'll skip it for now
+-    logger.info("Note: SerperNewsScraper is skipped as it requires additional conversion logic.")
++    # SerperNewsScraper
++    try:
++        serper_scraper = SerperNewsScraper()
++        serper_results = serper_scraper.search("AI news OR artificial intelligence OR LLM", num=20)
++        serper_articles: List[Article] = []
++        for item in serper_results:
++            raw = {
++                "title": item.get("title"),
++                "link": item.get("link"),
++                "published": item.get("date") or datetime.utcnow(),
++                "source": item.get("source") or "Serper News",
++                "summary": item.get("snippet")
++            }
++            try:
++                serper_articles.append(Article.from_raw_article(raw))
++            except Exception as e:
++                logger.warning(f"Serper item conversion failed: {e}")
++        scraper_tasks.append(asyncio.sleep(0, result=serper_articles))
++        logger.info(f"SerperNewsScraper collected {len(serper_articles)} items")
++    except Exception as e:
++        logger.warning(f"SerperNewsScraper skipped due to error: {e}")
+ 
+     # Await all scraper tasks with error handling
+     logger.info(f"Awaiting {len(scraper_tasks)} scraper tasks concurrently...")
+@@ -320,41 +345,41 @@ async def main():
+         logger.warning("Please ensure SUPABASE_URL and SUPABASE_KEY are set correctly in your environment/config, and articles are successfully processed.")
+     logger.info(f"------------------------------------------")
+ 
+-    # --- New steps: Static Page Generation and Email Sending ---
+-    logger.info("Proceeding with generating static HTML page and preparing email content.")
+-    try:
+-        logger.info(f"Using output directory: {settings.OUTPUT_DIR}")
+-        logger.info(f"Using recipient email: {settings.RECIPIENT_EMAIL}")
+-        logger.info(f"Using sender email: {settings.SENDER_EMAIL}")
+-        logger.info(f"Using GitHub Pages Base URL: {settings.GITHUB_PAGES_BASE_URL}")
+-    except AttributeError as e:
+-        logger.warning(f"Some configuration attributes are missing: {e}. Using defaults.")
+-        logger.info("Note: OUTPUT_DIR, RECIPIENT_EMAIL, SENDER_EMAIL, GITHUB_PAGES_BASE_URL may not be configured.")
+-
+-    # Use DisplayModule with processed_articles
++    # --- Static Page Generation and Email Sending ---
++    logger.info("Generating static page and preparing email content.")
++    display_module = DisplayModule()
++
+     if processed_articles:
+-        display_module = DisplayModule() # No articles passed at init
+-        mindmap_content = display_module.generate_mindmap_markdown(processed_articles)
+-        timeline_content = display_module.generate_timeline_markdown(processed_articles)
+-        summary_statistics = display_module.generate_summary_statistics(processed_articles)
+-        
+-        logger.info(f"Generated mindmap content (first 200 chars): {mindmap_content[:200]}...")
+-        logger.info(f"Generated timeline content (first 200 chars): {timeline_content[:200]}...")
+-        logger.info(f"Generated summary statistics (first 200 chars): {summary_statistics[:200]}...")
+-        
+-        # Placeholder for writing to files and sending email
+-        # Example:
+-        # with open(os.path.join(settings.OUTPUT_DIR, "mindmap.md"), "w", encoding="utf-8") as f:
+-        #     f.write(mindmap_content)
+-        # with open(os.path.join(settings.OUTPUT_DIR, "timeline.md"), "w", encoding="utf-8") as f:
+-        #     f.write(timeline_content)
+-        # EmailSender.send_email(to=settings.RECIPIENT_EMAILS, subject="Daily Trend Report", body=timeline_content)
+-        
++        email_html = display_module.generate_email_html(processed_articles, settings.GITHUB_PAGES_BASE_URL)
++        display_module.generate_static_site(
++            settings.OUTPUT_DIR,
++            processed_articles,
++            settings.GITHUB_PAGES_BASE_URL,
++            settings.SUPABASE_URL,
++            settings.SUPABASE_ANON_KEY
++        )
++
++        if settings.SENDER_EMAIL and settings.RECIPIENT_EMAIL:
++            send_daily_email("每日AI趋势简报", email_html)
++        else:
++            logger.warning("SENDER_EMAIL or RECIPIENT_EMAIL missing, skipping email send.")
+     else:
+-        logger.warning("No processed articles available for DisplayModule. Static page and email content will be empty or minimal.")
++        logger.warning("No processed articles available. Skipping email and static site generation.")
+ 
+-    logger.info("Static page generation and email sending will be finalized in subsequent steps.")
+-    # --- End of new steps ---
++    # --- Favorite analysis ---
++    if supabase_manager is not None:
++        try:
++            favorite_articles = await asyncio.to_thread(supabase_manager.fetch_favorites_needing_analysis)
++            if favorite_articles:
++                logger.info(f"Found {len(favorite_articles)} favorite articles needing analysis")
++                for fav in favorite_articles:
++                    analysis = await generate_favorite_analysis(fav)
++                    if analysis:
++                        await asyncio.to_thread(supabase_manager.update_favorite_analysis, fav.id, analysis)
++            else:
++                logger.info("No favorite articles pending analysis")
++        except Exception as e:
++            logger.warning(f"Favorite analysis failed: {e}")
+ 
+     end_time = datetime.now()
+     duration = end_time - start_time
+diff --git a/src/nlp_processor.py b/src/nlp_processor.py
+index 05f42bb..f6b96db 100644
+--- a/src/nlp_processor.py
++++ b/src/nlp_processor.py
+@@ -1,182 +1,208 @@
+ # src/nlp_processor.py
+ import json
+ import logging
++import os
+ from typing import List, Dict, Any
+ import asyncio
+ 
++from openai import OpenAI
+ from src.data_models import Article
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# 模拟 OpenRouter API 调用的函数
+-async def call_openrouter_api(prompt: str) -> Dict[str, Any]:
+-    """
+-    模拟调用 OpenRouter API。
+-    在实际部署时，这里需要替换为真正的 OpenRouter API 调用。
+-    
+-    :param prompt: 发送给 API 的提示文本
+-    :return: 包含 API 响应的字典
+-    """
+-    logger.debug(f"Simulating OpenRouter API call with prompt: {prompt[:100]}...")
+-    await asyncio.sleep(0.5)  # 模拟网络延迟
+-
+-    # 简单的模拟回复，根据 prompt 尝试提取信息
+-    prompt_lower = prompt.lower()
+-    
+-    entities = []
+-    main_tags = []
+-    
+-    # 简单的关键词匹配来模拟实体和标签抽取
+-    # 实体识别
+-    entity_keywords = {
+-        "Google": ["google", "alphabet"],
+-        "OpenAI": ["openai", "gpt", "chatgpt"],
+-        "NVIDIA": ["nvidia", "cuda"],
+-        "Microsoft": ["microsoft", "azure"],
+-        "Meta": ["meta", "facebook"],
+-        "Anthropic": ["anthropic", "claude"],
+-        "Hugging Face": ["hugging face", "huggingface"],
+-        "PyTorch": ["pytorch"],
+-        "TensorFlow": ["tensorflow"],
+-        "LLM": ["llm", "large language model", "language model"],
+-        "Transformer": ["transformer", "attention"],
+-    }
+-    
+-    for entity, keywords in entity_keywords.items():
+-        if any(keyword in prompt_lower for keyword in keywords):
+-            entities.append(entity)
+-    
+-    # 标签识别（能力/成本/范式/格局）
+-    if any(keyword in prompt_lower for keyword in ["capability", "ability", "performance", "benchmark", "accuracy", "能力", "性能"]):
+-        main_tags.append("能力")
+-    if any(keyword in prompt_lower for keyword in ["price", "cost", "rate limit", "pricing", "cost-effective", "成本", "价格", "费用"]):
+-        main_tags.append("成本")
+-    if any(keyword in prompt_lower for keyword in ["paradigm", "framework", "architecture", "method", "approach", "范式", "框架", "方法"]):
+-        main_tags.append("范式")
+-    if any(keyword in prompt_lower for keyword in ["company", "partnership", "ecosystem", "market", "finance", "business", "格局", "市场", "商业"]):
+-        main_tags.append("格局")
+-    
+-    # 如果没有匹配到标签，尝试从内容推断
+-    if not main_tags:
+-        if "ai" in prompt_lower or "artificial intelligence" in prompt_lower or "machine learning" in prompt_lower:
+-            main_tags.append("能力")
+-    
+-    # 返回模拟的响应结构（模拟 OpenRouter API 的响应格式）
+-    response_content = {
+-        "entities": entities[:10],  # 限制实体数量
+-        "main_tags": main_tags[:4]  # 最多4个标签
+-    }
+-    
+-    return {
+-        "choices": [{
+-            "message": {
+-                "content": json.dumps(response_content, ensure_ascii=False)
+-            }
+-        }]
+-    }
++OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
++OPENAI_MODEL = os.environ.get("OPENAI_MODEL")
++
++
++def _build_client() -> OpenAI:
++    if not OPENAI_API_KEY:
++        raise ValueError("OPENAI_API_KEY is missing")
++    # OpenRouter key starts with sk-or-
++    if OPENAI_API_KEY.startswith("sk-or-"):
++        return OpenAI(api_key=OPENAI_API_KEY, base_url="https://openrouter.ai/api/v1")
++    return OpenAI(api_key=OPENAI_API_KEY)
++
++
++def _select_model() -> str:
++    if OPENAI_MODEL:
++        return OPENAI_MODEL
++    if OPENAI_API_KEY and OPENAI_API_KEY.startswith("sk-or-"):
++        return "openai/gpt-4o-mini"
++    return "gpt-4o-mini"
++
++
++async def call_llm(prompt: str) -> Dict[str, Any]:
++    client = _build_client()
++    model = _select_model()
++
++    def _call():
++        return client.chat.completions.create(
++            model=model,
++            messages=[
++                {
++                    "role": "system",
++                    "content": "你是AI新闻分析助手。只输出JSON，不要额外文字。",
++                },
++                {"role": "user", "content": prompt},
++            ],
++            temperature=0.2,
++            response_format={"type": "json_object"},
++        )
++
++    response = await asyncio.to_thread(_call)
++    return response.model_dump() if hasattr(response, "model_dump") else response
++
++
++async def call_llm_text(prompt: str) -> str:
++    client = _build_client()
++    model = _select_model()
++
++    def _call():
++        return client.chat.completions.create(
++            model=model,
++            messages=[
++                {
++                    "role": "system",
++                    "content": "你是AI新闻分析助手。只输出中文文本，不要额外格式。",
++                },
++                {"role": "user", "content": prompt},
++            ],
++            temperature=0.2,
++        )
++
++    response = await asyncio.to_thread(_call)
++    payload = response.model_dump() if hasattr(response, "model_dump") else response
++    return payload["choices"][0]["message"]["content"].strip()
++
++
++def _safe_json_parse(text: str) -> Dict[str, Any]:
++    try:
++        return json.loads(text)
++    except Exception:
++        start = text.find("{")
++        end = text.rfind("}")
++        if start != -1 and end != -1 and end > start:
++            try:
++                return json.loads(text[start : end + 1])
++            except Exception:
++                return {}
++        return {}
++
+ 
+ async def process_article_with_nlp(article: Article) -> Article:
+-    """
+-    使用 NLP (OpenRouter) 处理单个 Article 实例，填充实体、标签和简述。
+-    
+-    :param article: 待处理的 Article 实例
+-    :return: 处理后的 Article 实例（已填充 entities, main_tags, short_description）
+-    """
+     logger.info(f"Processing article '{article.title[:60]}...' with NLP...")
+-    
+-    # 构建发送给 OpenRouter 的 prompt
+-    # 优先使用 content，如果不存在则使用 summary
+-    content_to_analyze = article.content if article.content else article.summary
+-    content_preview = content_to_analyze[:2000] if len(content_to_analyze) > 2000 else content_to_analyze  # 限制长度避免prompt过长
+-    
+-    prompt = f"""
+-请根据以下文章信息，提炼出核心实体、主要标签（能力/成本/范式/格局）。
+ 
+-文章标题: {article.title}
+-文章摘要/内容: {content_preview}
++    content_to_analyze = article.content or article.summary or article.title
++    content_preview = (
++        content_to_analyze[:3000] if len(content_to_analyze) > 3000 else content_to_analyze
++    )
++
++    prompt = f"""
++请根据以下文章信息，输出中文结构化结果，字段如下：
+ 
+-请以 JSON 格式返回结果，包含以下字段：
+ {{
+-    "entities": ["实体1", "实体2"],
+-    "main_tags": ["标签1", "标签2"]
++  \"summary_zh\": \"中文简报（80-150字）\",
++  \"key_points\": [\"要点1\", \"要点2\", \"要点3\"],
++  \"entities\": [\"实体1\", \"实体2\"],
++  \"main_tags\": [\"能力\", \"成本\", \"范式\", \"格局\", \"产品\", \"政策\", \"融资\", \"开源\"],
++  \"trend_tag\": \"趋势标签（能力/成本/范式/格局/产品/政策/融资/开源之一）\",
++  \"heat_score\": 0-100
+ }}
++
++文章标题: {article.title}
++文章摘要/内容: {content_preview}
+ """
+ 
+     try:
+-        # 调用模拟的 OpenRouter API
+-        response = await call_openrouter_api(prompt)
+-        
+-        # 解析响应
+-        response_content_str = response['choices'][0]['message']['content']
+-        
+-        # 尝试解析 JSON
+-        try:
+-            nlp_data = json.loads(response_content_str)
+-        except json.JSONDecodeError:
+-            # 如果解析失败，尝试使用 eval（仅用于模拟，生产环境应避免）
+-            logger.warning(f"Failed to parse JSON response, using fallback parsing for article '{article.title[:60]}...'")
+-            try:
+-                nlp_data = eval(response_content_str)
+-            except Exception as e:
+-                logger.error(f"Failed to parse response for article '{article.title[:60]}...': {e}")
+-                nlp_data = {
+-                    "entities": [],
+-                    "main_tags": []
+-                }
+-
+-        # 更新 Article 实例
+-        # Note: entities should be Dict[str, List[str]] according to Article model
++        response = await call_llm(prompt)
++        response_content_str = response["choices"][0]["message"]["content"]
++        nlp_data = _safe_json_parse(response_content_str)
++
++        article.summary_zh = nlp_data.get("summary_zh")
++        article.key_points = (
++            nlp_data.get("key_points", [])
++            if isinstance(nlp_data.get("key_points"), list)
++            else []
++        )
++
+         entities_list = nlp_data.get("entities", [])
+         if isinstance(entities_list, list):
+-            # Convert list to dict format: {"PERSON": [...], "ORG": [...], etc.}
+             article.entities = {"MISC": entities_list} if entities_list else {}
++        elif isinstance(entities_list, dict):
++            article.entities = entities_list
++        else:
++            article.entities = {}
++
++        article.main_tags = (
++            nlp_data.get("main_tags", [])
++            if isinstance(nlp_data.get("main_tags"), list)
++            else []
++        )
++        article.trend_tag = nlp_data.get("trend_tag")
++
++        heat_score = nlp_data.get("heat_score")
++        if isinstance(heat_score, (int, float)):
++            article.heat_score = max(0, min(100, float(heat_score)))
+         else:
+-            article.entities = entities_list if isinstance(entities_list, dict) else {}
+-        
+-        article.main_tags = nlp_data.get("main_tags", [])
+-        # Note: Article model doesn't have short_description field, so we skip it
+-        
+-        logger.debug(f"NLP processed: '{article.title[:60]}...'. Entities: {article.entities}, Tags: {article.main_tags}")
++            article.heat_score = None
+ 
+     except Exception as e:
+-        logger.error(f"Error processing article '{article.title[:60]}...' with NLP: {e}", exc_info=True)
+-        # 确保即使出错也返回有效的默认值
++        logger.error(
++            f"Error processing article '{article.title[:60]}...' with NLP: {e}",
++            exc_info=True,
++        )
+         if not article.entities:
+             article.entities = {}
+         if not article.main_tags:
+             article.main_tags = []
+-    
++
+     return article
+ 
+-async def process_articles_batch(articles: List[Article], batch_size: int = 10) -> List[Article]:
+-    """
+-    批量处理文章，支持并发处理以提高效率。
+-    
+-    :param articles: 待处理的文章列表
+-    :param batch_size: 每批处理的文章数量（控制并发度）
+-    :return: 处理后的文章列表
+-    """
++
++async def generate_favorite_analysis(article: Article) -> str:
++    content_to_analyze = article.content or article.summary or article.title
++    content_preview = (
++        content_to_analyze[:3500] if len(content_to_analyze) > 3500 else content_to_analyze
++    )
++
++    prompt = f"""
++请基于以下文章内容，给出精炼中文分析，要求：
++1) 150-250字
++2) 删掉废话，保留关键信息
++3) 点出对行业的影响或趋势判断
++
++文章标题: {article.title}
++文章内容: {content_preview}
++"""
++
++    try:
++        return await call_llm_text(prompt)
++    except Exception as e:
++        logger.error(f"Failed to generate favorite analysis: {e}", exc_info=True)
++        return ""
++
++
++async def process_articles_batch(
++    articles: List[Article], batch_size: int = 10
++) -> List[Article]:
+     logger.info(f"Processing {len(articles)} articles in batches of {batch_size}...")
+-    
++
+     processed_articles = []
+-    
+-    # 分批处理
++
+     for i in range(0, len(articles), batch_size):
+-        batch = articles[i:i + batch_size]
++        batch = articles[i : i + batch_size]
+         logger.info(f"Processing batch {i // batch_size + 1} ({len(batch)} articles)...")
+-        
+-        # 并发处理当前批次
++
+         batch_results = await asyncio.gather(
+             *[process_article_with_nlp(article) for article in batch],
+-            return_exceptions=True
++            return_exceptions=True,
+         )
+-        
+-        # 处理结果，过滤掉异常
++
+         for result in batch_results:
+             if isinstance(result, Exception):
+                 logger.error(f"Error in batch processing: {result}")
+             else:
+                 processed_articles.append(result)
+-    
++
+     logger.info(f"Finished processing {len(processed_articles)} articles.")
+     return processed_articles
+diff --git a/src/scrapers/rss_scraper.py b/src/scrapers/rss_scraper.py
+index 12a16f6..0a88693 100644
+--- a/src/scrapers/rss_scraper.py
++++ b/src/scrapers/rss_scraper.py
+@@ -10,17 +10,25 @@ from src.data_models import Article
+ 
+ logger = logging.getLogger(__name__)
+ 
++
+ class RSSScraper:
+-    def __init__(self, feed_configs: List[Dict[str, str]]):
++    def __init__(self, feed_configs: List[Dict[str, str]], max_entries_per_feed: int = 100,
++                 skip_full_content_for_arxiv: bool = True):
+         """
+         初始化 RSSScraper。
+         :param feed_configs: 包含 RSS feed 配置的字典列表。
+                              每个字典应包含 'name' (feed 名称) 和 'url' (feed URL)。
+                              例如：[{'name': 'OpenAI Blog', 'url': 'https://openai.com/blog/rss'}, ...]
++        :param max_entries_per_feed: 每个 RSS 源最多处理多少条（用于加速测试）。
++        :param skip_full_content_for_arxiv: 是否跳过 arXiv RSS 的详情页抓取。
+         """
+         self.feed_configs = feed_configs
++        self.max_entries_per_feed = max_entries_per_feed
++        self.skip_full_content_for_arxiv = skip_full_content_for_arxiv
+         self.last_fetched_times: Dict[str, datetime] = {}  # 记录每个 feed 最后抓取时间，用于去重和增量抓取
+ 
++
++
+     async def _fetch_full_content(self, url: str) -> Optional[str]:
+         """
+         访问文章链接并尝试提取文章正文。
+@@ -86,8 +94,10 @@ class RSSScraper:
+             logger.info(f"Fetching RSS feed: {feed_name} from {feed_url}")
+ 
+             try:
+-                # feedparser 已经是同步库，直接调用即可
+-                feed = feedparser.parse(feed_url)
++                async with httpx.AsyncClient(timeout=10.0) as client:
++                    response = await client.get(feed_url, follow_redirects=True)
++                    response.raise_for_status()
++                feed = feedparser.parse(response.text)
+ 
+                 if feed.bozo:
+                     logger.warning(f"Error parsing feed {feed_name} ({feed_url}): {feed.bozo_exception}")
+@@ -96,7 +106,20 @@ class RSSScraper:
+                 fetched_count = 0
+                 filtered_count = 0
+ 
++                # arXiv RSS 通常详情页抓取慢，按配置跳过
++                effective_fetch_full_content = fetch_full_content
++                if self.skip_full_content_for_arxiv and 'arxiv.org' in feed_url:
++                    effective_fetch_full_content = False
++                    logger.info(f"Skipping full content fetch for arXiv feed: {feed_name}")
++
+                 for entry in feed.entries:
++                    # 限制每个 RSS 源处理的最大条数
++                    if self.max_entries_per_feed and fetched_count >= self.max_entries_per_feed:
++                        logger.info(
++                            f"Reached max entries limit ({self.max_entries_per_feed}) for feed '{feed_name}'."
++                        )
++                        break
++
+                     fetched_count += 1
+                     published_parsed = entry.get('published_parsed')
+                     if published_parsed:
+@@ -109,22 +132,22 @@ class RSSScraper:
+                     # 日期过滤
+                     if entry_published_utc >= start_date_utc:
+                         filtered_count += 1
+-                        
++
+                         # 构建符合 Article.from_raw_article() 期望的数据结构
+                         title = entry.get('title', 'N/A')
+                         link = entry.get('link', 'N/A')
+                         summary = entry.get('summary', entry.get('description', ''))
+-                        
++
+                         # 提取作者列表
+                         authors = []
+                         if entry.get('authors'):
+                             authors = [author.get('name', '') for author in entry.get('authors', []) if author.get('name')]
+-                        
++
+                         # 提取标签/分类
+                         tags = []
+                         if entry.get('tags'):
+                             tags = [tag.get('term', '') for tag in entry.get('tags', []) if tag.get('term')]
+-                        
++
+                         article_data = {
+                             "title": title,
+                             "link": link,
+@@ -137,12 +160,12 @@ class RSSScraper:
+                             "entities": {},  # Dict[str, List[str]] format
+                             "language": "en",  # Default language
+                         }
+-                        
++
+                         # 创建 Article 实例
+                         article = Article.from_raw_article(article_data)
+-                        
++
+                         # 尝试抓取完整内容
+-                        if fetch_full_content and article.link:
++                        if effective_fetch_full_content and article.link:
+                             logger.debug(f"Fetching full content for article: {article.title[:60]}...")
+                             full_content = await self._fetch_full_content(str(article.link))
+                             if full_content:
+@@ -151,7 +174,7 @@ class RSSScraper:
+                                 logger.debug(f"Successfully fetched full content ({len(full_content)} chars)")
+                             else:
+                                 logger.debug(f"Failed to fetch full content for article: {article.title[:60]}...")
+-                        
++
+                         logger.info(f"Scraped RSS article from '{feed_name}': {article.title}")
+                         yield article
+                     else:
+-- 
+2.47.3
+

@@ -1,0 +1,35 @@
+diff --git a/docs/favorite.html b/docs/favorite.html
+index c5170ce..e550947 100644
+--- a/docs/favorite.html
++++ b/docs/favorite.html
+@@ -7,7 +7,7 @@
+             const params = new URLSearchParams(window.location.search);
+             const id = params.get('id');
+             if (!id) { document.body.innerHTML = '<h3>缺少文章ID</h3>'; }
+-            const url = 'http://ietunkxgukxpeacoiigl.supabase.co/rest/v1/articles?id=eq.' + encodeURIComponent(id);
++            const url = 'https://ietunkxgukxpeacoiigl.supabase.co/rest/v1/articles?id=eq.' + encodeURIComponent(id);
+             fetch(url, {
+               method: 'PATCH',
+               headers: {
+diff --git a/src/display_module.py b/src/display_module.py
+index d89ce82..e47020c 100644
+--- a/src/display_module.py
++++ b/src/display_module.py
+@@ -375,6 +375,8 @@ class DisplayModule:
+ 
+         (output_dir / "index.html").write_text(index_html, encoding="utf-8")
+ 
++        safe_supabase_url = supabase_url.replace("http://", "https://", 1) if supabase_url.startswith("http://") else supabase_url
++
+         # Favorite handler page (static)
+         favorite_html = f"""
+         <html>
+@@ -385,7 +387,7 @@ class DisplayModule:
+             const params = new URLSearchParams(window.location.search);
+             const id = params.get('id');
+             if (!id) {{ document.body.innerHTML = '<h3>缺少文章ID</h3>'; }}
+-            const url = '{supabase_url}/rest/v1/articles?id=eq.' + encodeURIComponent(id);
++            const url = '{safe_supabase_url}/rest/v1/articles?id=eq.' + encodeURIComponent(id);
+             fetch(url, {{
+               method: 'PATCH',
+               headers: {{

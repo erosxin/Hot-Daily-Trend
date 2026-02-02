@@ -10,16 +10,24 @@ from src.data_models import Article
 
 logger = logging.getLogger(__name__)
 
+
 class RSSScraper:
-    def __init__(self, feed_configs: List[Dict[str, str]]):
+    def __init__(self, feed_configs: List[Dict[str, str]], max_entries_per_feed: int = 100,
+                 skip_full_content_for_arxiv: bool = True):
         """
         初始化 RSSScraper。
         :param feed_configs: 包含 RSS feed 配置的字典列表。
                              每个字典应包含 'name' (feed 名称) 和 'url' (feed URL)。
                              例如：[{'name': 'OpenAI Blog', 'url': 'https://openai.com/blog/rss'}, ...]
+        :param max_entries_per_feed: 每个 RSS 源最多处理多少条（用于加速测试）。
+        :param skip_full_content_for_arxiv: 是否跳过 arXiv RSS 的详情页抓取。
         """
         self.feed_configs = feed_configs
+        self.max_entries_per_feed = max_entries_per_feed
+        self.skip_full_content_for_arxiv = skip_full_content_for_arxiv
         self.last_fetched_times: Dict[str, datetime] = {}  # 记录每个 feed 最后抓取时间，用于去重和增量抓取
+
+
 
     async def _fetch_full_content(self, url: str) -> Optional[str]:
         """
@@ -86,8 +94,10 @@ class RSSScraper:
             logger.info(f"Fetching RSS feed: {feed_name} from {feed_url}")
 
             try:
-                # feedparser 已经是同步库，直接调用即可
-                feed = feedparser.parse(feed_url)
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(feed_url, follow_redirects=True)
+                    response.raise_for_status()
+                feed = feedparser.parse(response.text)
 
                 if feed.bozo:
                     logger.warning(f"Error parsing feed {feed_name} ({feed_url}): {feed.bozo_exception}")
@@ -96,7 +106,20 @@ class RSSScraper:
                 fetched_count = 0
                 filtered_count = 0
 
+                # arXiv RSS 通常详情页抓取慢，按配置跳过
+                effective_fetch_full_content = fetch_full_content
+                if self.skip_full_content_for_arxiv and 'arxiv.org' in feed_url:
+                    effective_fetch_full_content = False
+                    logger.info(f"Skipping full content fetch for arXiv feed: {feed_name}")
+
                 for entry in feed.entries:
+                    # 限制每个 RSS 源处理的最大条数
+                    if self.max_entries_per_feed and fetched_count >= self.max_entries_per_feed:
+                        logger.info(
+                            f"Reached max entries limit ({self.max_entries_per_feed}) for feed '{feed_name}'."
+                        )
+                        break
+
                     fetched_count += 1
                     published_parsed = entry.get('published_parsed')
                     if published_parsed:
@@ -109,22 +132,22 @@ class RSSScraper:
                     # 日期过滤
                     if entry_published_utc >= start_date_utc:
                         filtered_count += 1
-                        
+
                         # 构建符合 Article.from_raw_article() 期望的数据结构
                         title = entry.get('title', 'N/A')
                         link = entry.get('link', 'N/A')
                         summary = entry.get('summary', entry.get('description', ''))
-                        
+
                         # 提取作者列表
                         authors = []
                         if entry.get('authors'):
                             authors = [author.get('name', '') for author in entry.get('authors', []) if author.get('name')]
-                        
+
                         # 提取标签/分类
                         tags = []
                         if entry.get('tags'):
                             tags = [tag.get('term', '') for tag in entry.get('tags', []) if tag.get('term')]
-                        
+
                         article_data = {
                             "title": title,
                             "link": link,
@@ -137,12 +160,12 @@ class RSSScraper:
                             "entities": {},  # Dict[str, List[str]] format
                             "language": "en",  # Default language
                         }
-                        
+
                         # 创建 Article 实例
                         article = Article.from_raw_article(article_data)
-                        
+
                         # 尝试抓取完整内容
-                        if fetch_full_content and article.link:
+                        if effective_fetch_full_content and article.link:
                             logger.debug(f"Fetching full content for article: {article.title[:60]}...")
                             full_content = await self._fetch_full_content(str(article.link))
                             if full_content:
@@ -151,7 +174,7 @@ class RSSScraper:
                                 logger.debug(f"Successfully fetched full content ({len(full_content)} chars)")
                             else:
                                 logger.debug(f"Failed to fetch full content for article: {article.title[:60]}...")
-                        
+
                         logger.info(f"Scraped RSS article from '{feed_name}': {article.title}")
                         yield article
                     else:

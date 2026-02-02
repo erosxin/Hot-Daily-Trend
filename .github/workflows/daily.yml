@@ -1,0 +1,43 @@
+name: Daily AI Trend
+
+on:
+  schedule:
+    - cron: "0 23 * * *" # 07:00 Beijing (UTC+8)
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write env file
+        run: |
+          cat << 'EOF' > .env
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          SERPER_API_KEY=${{ secrets.SERPER_API_KEY }}
+          RESEND_API_KEY=${{ secrets.RESEND_API_KEY }}
+          RECIPIENT_EMAIL=${{ secrets.RECIPIENT_EMAIL }}
+          SENDER_EMAIL=${{ secrets.SENDER_EMAIL }}
+          GITHUB_PAGES_BASE_URL=${{ secrets.GITHUB_PAGES_BASE_URL }}
+          EOF
+
+      - name: Run scraper
+        run: python -m src.main_scraper
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./output
