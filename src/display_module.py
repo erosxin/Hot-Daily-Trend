@@ -300,14 +300,20 @@ class DisplayModule:
         for a in top_articles:
             heat = f"{int(a.heat_score)}" if a.heat_score is not None else "-"
             summary = a.summary_zh or a.summary or ""
+            plain_summary = a.plain_summary or ""
             key_points = "".join([f"<li>{p}</li>" for p in (a.key_points or [])[:3]])
             fav_link = f"{base_url}/favorite.html?id={a.id}" if a.id else "#"
+            
+            # 如果有通俗总结，添加到显示中
+            plain_summary_html = f"<div style='font-size:13px;color:#2563eb;margin:8px 0;padding:8px;background:#f0f7ff;border-radius:4px;'>💡 {plain_summary}</div>" if plain_summary else ""
+            
             rows.append(
                 f"""
                 <div style='padding:12px 0;border-bottom:1px solid #eee;'>
                   <div style='font-size:16px;font-weight:600;margin-bottom:6px;'>{a.title}</div>
                   <div style='color:#666;font-size:12px;margin-bottom:8px;'>来源: {a.source} | 热度: {heat}</div>
                   <div style='font-size:14px;margin-bottom:6px;'>{summary}</div>
+                  {plain_summary_html}
                   <ul style='margin:4px 0 8px 18px;padding:0;'>{key_points}</ul>
                   <div style='font-size:13px;'>
                     <a href='{str(a.link)}' target='_blank'>查看原文</a> | 
@@ -337,13 +343,19 @@ class DisplayModule:
         for a in articles:
             heat = f"{int(a.heat_score)}" if a.heat_score is not None else "-"
             summary = a.summary_zh or a.summary or ""
+            plain_summary = a.plain_summary or ""
             fav_link = f"{base_url}/favorite.html?id={a.id}" if a.id else "#"
+            
+            # 如果有通俗总结，添加到显示中
+            plain_summary_html = f"<div class='plain-summary'>💡 {plain_summary}</div>" if plain_summary else ""
+            
             items_html.append(
                 f"""
                 <div class='item'>
                   <div class='title'>{a.title}</div>
                   <div class='meta'>来源: {a.source} | 热度: {heat}</div>
                   <div class='summary'>{summary}</div>
+                  {plain_summary_html}
                   <div class='links'>
                     <a href='{str(a.link)}' target='_blank'>查看原文</a>
                     <a href='{fav_link}' target='_blank'>收藏并生成简析</a>
@@ -363,6 +375,7 @@ class DisplayModule:
             .title {{ font-size: 18px; font-weight: 600; margin-bottom: 6px; }}
             .meta {{ font-size: 12px; color: #666; margin-bottom: 6px; }}
             .summary {{ font-size: 14px; margin-bottom: 6px; }}
+            .plain-summary {{ font-size: 13px; color: #2563eb; margin: 8px 0; padding: 8px; background: #f0f7ff; border-radius: 4px; }}
             .links a {{ margin-right: 10px; }}
           </style>
         </head>
@@ -375,6 +388,8 @@ class DisplayModule:
 
         (output_dir / "index.html").write_text(index_html, encoding="utf-8")
 
+        safe_supabase_url = supabase_url.replace("http://", "https://", 1) if supabase_url.startswith("http://") else supabase_url
+
         # Favorite handler page (static)
         favorite_html = f"""
         <html>
@@ -384,22 +399,59 @@ class DisplayModule:
           <script>
             const params = new URLSearchParams(window.location.search);
             const id = params.get('id');
-            if (!id) {{ document.body.innerHTML = '<h3>缺少文章ID</h3>'; }}
-            const url = '{supabase_url}/rest/v1/articles?id=eq.' + encodeURIComponent(id);
-            fetch(url, {{
-              method: 'PATCH',
-              headers: {{
-                'apikey': '{supabase_anon_key}',
-                'Authorization': 'Bearer {supabase_anon_key}',
-                'Content-Type': 'application/json',
-                'Prefer': 'return=representation'
-              }},
-              body: JSON.stringify({{ is_favorite: true }})
-            }}).then(res => res.json()).then(data => {{
-              document.body.innerHTML = '<h3>收藏成功，简析将在下一次任务运行后生成</h3>';
-            }}).catch(err => {{
-              document.body.innerHTML = '<h3>收藏失败，请稍后重试</h3>';
-            }});
+            if (!id) {{ document.body.innerHTML = '<h3>缺少文章ID</h3>'; throw new Error('Missing article ID'); }}
+
+            const supabaseUrl = '{safe_supabase_url}';
+            const supabaseKey = '{supabase_anon_key}';
+            
+            // 初始化 Supabase client
+            const supabase = supabase.createClient(supabaseUrl, supabaseKey);
+
+            // 调用 Edge Function
+            async function processFavorite() {{
+              try {{
+                // 尝试匿名登录获取 JWT
+                const {{ data: {{ user }}, error: authError }} = await supabase.auth.signInAnonymously();
+                
+                if (authError || !user) {{
+                  // 如果匿名登录失败，直接调用（用 service role）
+                  const response = await fetch(
+                    supabaseUrl + '/functions/v1/process-favorite',
+                    {{
+                      method: 'POST',
+                      headers: {{
+                        'Authorization': 'Bearer ' + supabaseKey,
+                        'Content-Type': 'application/json'
+                      }},
+                      body: JSON.stringify({{ article_id: id }})
+                    }}
+                  );
+                  const result = await response.json();
+                  if (result.success) {{
+                    document.body.innerHTML = '<h3>收藏成功，简析已生成</h3><p>' + (result.plain_summary || '') + '</p>';
+                  }} else {{
+                    document.body.innerHTML = '<h3>处理失败: ' + (result.error || '未知错误') + '</h3>';
+                  }}
+                }} else {{
+                  // 匿名登录成功，用 JWT 调用
+                  const {{ data, error }} = await supabase.functions.invoke('process-favorite', {{
+                    body: {{ article_id: id }}
+                  }});
+                  
+                  if (error) {{
+                    document.body.innerHTML = '<h3>错误: ' + error.message + '</h3>';
+                  }} else if (data && data.success) {{
+                    document.body.innerHTML = '<h3>收藏成功，简析已生成</h3><p>' + (data.plain_summary || '') + '</p>';
+                  }} else {{
+                    document.body.innerHTML = '<h3>处理失败</h3>';
+                  }}
+                }}
+              }} catch (err) {{
+                document.body.innerHTML = '<h3>错误: ' + err.message + '</h3>';
+              }}
+            }}
+
+            processFavorite();
           </script>
         </body>
         </html>

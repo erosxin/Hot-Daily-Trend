@@ -14,6 +14,15 @@ class Article(BaseModel):
     source: str = Field(..., description="Source (e.g., website name, RSS feed title) of the article.")
     summary: Optional[str] = Field(None, min_length=20, description="Generated summary of the article content.")
     content: Optional[str] = Field(None, description="Full or partial content of the article.")
+
+    summary_zh: Optional[str] = Field(None, min_length=10, description="中文简报")
+    is_favorite: bool = Field(False, description="是否收藏")
+
+    key_points: List[str] = Field(default_factory=list, description="三条要点（中文）")
+    trend_tag: Optional[str] = Field(None, description="趋势标签")
+    heat_score: Optional[float] = Field(None, description="热度评分 0-100")
+    favorite_analysis: Optional[str] = Field(None, description="收藏后AI简析（中文）")
+    plain_summary: Optional[str] = Field(None, description="通俗总结（用简单的话解释专业术语）")
     image_url: Optional[HttpUrl] = Field(None, description="URL of the main image for the article.")
     tags: List[str] = Field(default_factory=list, description="Keywords or categories associated with the article.")
     main_tags: List[str] = Field(default_factory=list, description="Primary tags extracted from the article.")
