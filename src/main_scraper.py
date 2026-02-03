@@ -256,6 +256,36 @@ async def main():
     logger.info(f"Articles after NLP processing: {len(processed_articles)}")
     logger.info(f"NLP processing: {initial_article_count_before_nlp} -> {len(processed_articles)} articles")
 
+    # =====================================================
+    # 去重逻辑 - 基于标题相似度
+    # =====================================================
+    logger.info(f"--- Deduplication Stage ---")
+    deduplicated_articles = _deduplicate_articles(processed_articles)
+    logger.info(f"Articles after deduplication: {len(deduplicated_articles)}")
+    
+    # =====================================================
+    # 热度筛选 - 只保留高热度文章
+    # =====================================================
+    logger.info(f"--- Heat Score Filtering Stage ---")
+    MIN_HEAT_SCORE = 30  # 热度阈值，低于此值的文章被过滤
+    filtered_articles = [a for a in deduplicated_articles if (a.heat_score or 0) >= MIN_HEAT_SCORE]
+    logger.info(f"Articles with heat_score >= {MIN_HEAT_SCORE}: {len(filtered_articles)}")
+
+    # 如果过滤后太少，降低阈值再试
+    if len(filtered_articles) < 10:
+        MIN_HEAT_SCORE = 20
+        filtered_articles = [a for a in deduplicated_articles if (a.heat_score or 0) >= MIN_HEAT_SCORE]
+        logger.info(f"Lowered threshold to {MIN_HEAT_SCORE}: {len(filtered_articles)} articles")
+    
+    # 最终限制数量，确保阅读体验
+    MAX_FINAL_ARTICLES = 30  # 最多显示30篇
+    if len(filtered_articles) > MAX_FINAL_ARTICLES:
+        # 按热度排序，取 top N
+        filtered_articles = sorted(filtered_articles, key=lambda a: a.heat_score or 0, reverse=True)[:MAX_FINAL_ARTICLES]
+        logger.info(f"Limited to top {MAX_FINAL_ARTICLES} by heat_score")
+    
+    logger.info(f"Final articles for email: {len(filtered_articles)}")
+
     if processed_articles:
         sample_article_nlp = processed_articles[0]
         logger.info(f"Verifying first NLP processed article:")
@@ -294,17 +324,17 @@ async def main():
     # --- Conditional Check for Supabase Upsert ---
     logger.info(f"--- Supabase Upsert Conditional Check ---")
     is_supabase_ready = supabase_manager is not None and settings.SUPABASE_URL and settings.SUPABASE_KEY
-    has_articles_to_upsert = bool(processed_articles)
+    has_articles_to_upsert = bool(filtered_articles)
 
     logger.info(f"Supabase Manager initialized and configured: {is_supabase_ready}")
-    logger.info(f"Processed articles available for upsert: {has_articles_to_upsert} (Count: {len(processed_articles)})")
+    logger.info(f"Processed articles available for upsert: {has_articles_to_upsert} (Count: {len(filtered_articles)})")
     
     if is_supabase_ready and has_articles_to_upsert:
         logger.info("Conditions met: Attempting to upsert articles to Supabase.")
         
         # Log sample article structure before upsert
-        if processed_articles:
-            sample_for_upsert = processed_articles[0]
+        if filtered_articles:
+            sample_for_upsert = filtered_articles[0]
             logger.info(f"Sample article structure for upsert:")
             logger.info(f"  Type: {type(sample_for_upsert)}")
             logger.info(f"  Title: '{sample_for_upsert.title[:50]}...'")
@@ -316,16 +346,16 @@ async def main():
             logger.info(f"  Main tags: {sample_for_upsert.main_tags}")
             logger.info(f"  Entities type: {type(sample_for_upsert.entities)}, keys: {list(sample_for_upsert.entities.keys()) if isinstance(sample_for_upsert.entities, dict) else 'N/A'}")
         
-        logger.info(f"Attempting to upsert {len(processed_articles)} articles to Supabase table '{supabase_manager.table_name}'...")
+        logger.info(f"Attempting to upsert {len(filtered_articles)} articles to Supabase table '{supabase_manager.table_name}'...")
         try:
             # SupabaseManager.upsert_articles is synchronous, wrap with asyncio.to_thread
             inserted_count, skipped_count = await asyncio.to_thread(
-                supabase_manager.upsert_articles, processed_articles
+                supabase_manager.upsert_articles, filtered_articles
             )
             logger.info(f"Supabase upsert result: Inserted/Updated: {inserted_count}, Skipped: {skipped_count}")
-            if inserted_count == 0 and skipped_count == len(processed_articles) and len(processed_articles) > 0:
+            if inserted_count == 0 and skipped_count == len(filtered_articles) and len(filtered_articles) > 0:
                 logger.warning("All articles were skipped by Supabase. This often indicates RLS policies are blocking INSERT/UPDATE, or all articles already exist.")
-            elif inserted_count < len(processed_articles):
+            elif inserted_count < len(filtered_articles):
                 logger.info(f"Some articles were skipped/not inserted. This is normal if they already exist based on 'link' conflict.")
 
         except Exception as e:
@@ -349,11 +379,11 @@ async def main():
     logger.info("Generating static page and preparing email content.")
     display_module = DisplayModule()
 
-    if processed_articles:
-        email_html = display_module.generate_email_html(processed_articles, settings.GITHUB_PAGES_BASE_URL)
+    if filtered_articles:
+        email_html = display_module.generate_email_html(filtered_articles, settings.GITHUB_PAGES_BASE_URL)
         display_module.generate_static_site(
             settings.OUTPUT_DIR,
-            processed_articles,
+            filtered_articles,
             settings.GITHUB_PAGES_BASE_URL,
             settings.SUPABASE_URL,
             settings.SUPABASE_ANON_KEY
@@ -392,6 +422,43 @@ async def collect_from_async_iterator(async_iterator: AsyncIterator[Article]) ->
     async for item in async_iterator:
         items.append(item)
     return items
+
+
+def _deduplicate_articles(articles: List[Article]) -> List[Article]:
+    """
+    基于标题相似度去重。
+    使用简单的词重叠算法，避免重复内容出现在邮件中。
+    """
+    if not articles:
+        return []
+    
+    unique_articles = []
+    for article in articles:
+        title_lower = article.title.lower()
+        # 提取标题中的关键词（去掉常见词）
+        stop_words = {'the', 'a', 'an', 'of', 'and', 'or', 'in', 'on', 'at', 'to', 'for', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'can', 'this', 'that', 'these', 'those', 'it', 'its'}
+        words = set(title_lower.split())
+        words = words - stop_words
+        
+        is_duplicate = False
+        for existing in unique_articles:
+            existing_title = existing.title.lower()
+            existing_words = set(existing_title.split()) - stop_words
+            
+            # 计算词重叠率
+            if words and existing_words:
+                overlap = len(words & existing_words)
+                # 如果重叠词 >= 3，且两个标题都较短，认为是重复
+                if overlap >= 3:
+                    # 额外检查：标题长度相近
+                    if abs(len(title_lower) - len(existing_title)) < 50:
+                        is_duplicate = True
+                        break
+        
+        if not is_duplicate:
+            unique_articles.append(article)
+    
+    return unique_articles
 
 
 if __name__ == "__main__":
