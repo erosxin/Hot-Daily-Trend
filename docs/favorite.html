@@ -6,22 +6,41 @@
           <script>
             const params = new URLSearchParams(window.location.search);
             const id = params.get('id');
-            if (!id) { document.body.innerHTML = '<h3>缺少文章ID</h3>'; }
-            const url = 'https://ietunkxgukxpeacoiigl.supabase.co/rest/v1/articles?id=eq.' + encodeURIComponent(id);
-            fetch(url, {
-              method: 'PATCH',
-              headers: {
-                'apikey': 'sb_publishable_2J74WhPQQZ-U5qgbkUIAsQ_j_VHF4_7',
-                'Authorization': 'Bearer sb_publishable_2J74WhPQQZ-U5qgbkUIAsQ_j_VHF4_7',
-                'Content-Type': 'application/json',
-                'Prefer': 'return=representation'
-              },
-              body: JSON.stringify({ is_favorite: true })
-            }).then(res => res.json()).then(data => {
-              document.body.innerHTML = '<h3>收藏成功，简析将在下一次任务运行后生成</h3>';
-            }).catch(err => {
-              document.body.innerHTML = '<h3>收藏失败，请稍后重试</h3>';
-            });
+            if (!id) { document.body.innerHTML = '<h3>缺少文章ID</h3>'; throw new Error('Missing article ID'); }
+
+            const supabaseUrl = 'https://ietunkxgukxpeacoiigl.supabase.co';
+            const supabaseKey = 'sb_publishable_2J74WhPQQZ-U5qgbkUIAsQ_j_VHF4_7';
+            
+            // 初始化 Supabase client
+            const supabase = supabase.createClient(supabaseUrl, supabaseKey);
+
+            // 调用 Edge Function
+            async function processFavorite() {
+              try {
+                // 直接调用（用 service role + API key）
+                const response = await fetch(
+                  supabaseUrl + '/functions/v1/process-favorite?api_key=default-api-key',
+                  {
+                    method: 'POST',
+                    headers: {
+                      'Authorization': 'Bearer ' + supabaseKey,
+                      'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ article_id: id })
+                  }
+                );
+                const result = await response.json();
+                if (result.success) {
+                  document.body.innerHTML = '<h3>收藏成功，简析已生成</h3><p>' + (result.plain_summary || '') + '</p>';
+                } else {
+                  document.body.innerHTML = '<h3>处理失败: ' + (result.error || '未知错误') + '</h3>';
+                }
+              } catch (err) {
+                document.body.innerHTML = '<h3>错误: ' + err.message + '</h3>';
+              }
+            }
+
+            processFavorite();
           </script>
         </body>
         </html>
